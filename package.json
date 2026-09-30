@@ -1,0 +1,23 @@
+{
+  "name": "mendix-security-analyzer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mendix Studio Pro extension (10.24+) that checks an app against security governance rules",
+  "workspaces": [
+    "packages/*",
+    "extension"
+  ],
+  "scripts": {
+    "build:packages": "npm run build -w packages/application-ir && npm run build -w packages/rule-engine && npm run build -w packages/scoring && npm run build -w packages/rules && npm run build -w packages/mendix-parser",
+    "build:web": "npm run build -w extension",
+    "build:dotnet": "dotnet build extension/dotnet/SecurityAnalyzer.csproj -c Release",
+    "build": "npm run build:packages && npm run build:web && npm run build:dotnet",
+    "test": "npm run build:packages && npm run build:web && node --test \"tests/**/*.test.mjs\" \"extension/tests/**/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "UNLICENSED"
+}

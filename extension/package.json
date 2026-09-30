@@ -1,0 +1,22 @@
+{
+  "name": "@mendix-analyzer/security-analyzer-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mendix Studio Pro extension (10.24+) that runs the SEC-* security governance checks against the open app",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "npm run typecheck && node scripts/build.mjs",
+    "build:dotnet": "dotnet build dotnet/SecurityAnalyzer.csproj -c Release",
+    "test": "node --test \"tests/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "@mendix-analyzer/application-ir": "*",
+    "@mendix-analyzer/rule-engine": "*",
+    "@mendix-analyzer/rules": "*",
+    "@mendix-analyzer/scoring": "*"
+  },
+  "devDependencies": {
+    "@mendix-analyzer/mendix-parser": "*"
+  },
+  "license": "UNLICENSED"
+}

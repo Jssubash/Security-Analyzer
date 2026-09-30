@@ -1,0 +1,13 @@
+{
+  "name": "@mendix-analyzer/application-ir",
+  "version": "1.0.0",
+  "description": "Canonical Application Intermediate Representation for Mendix projects",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "keywords": ["mendix", "intermediate-representation", "ast"],
+  "license": "UNLICENSED"
+}

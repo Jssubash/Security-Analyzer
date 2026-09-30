@@ -1,0 +1,20 @@
+{
+  "name": "@mendix-analyzer/mendix-parser",
+  "version": "1.0.0",
+  "description": "Secure archive extractor and Mendix project parser",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "dependencies": {
+    "@mendix-analyzer/application-ir": "*",
+    "adm-zip": "^0.5.16"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22.10.0"
+  },
+  "license": "UNLICENSED"
+}
