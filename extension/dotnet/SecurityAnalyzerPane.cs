@@ -146,14 +146,14 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
             return;
         }
 
-        if (TryOpenById(app, unitId) || TryOpenByName(app, unitId))
+        if (TryOpenById(app, unitId) || TryOpenByName(app, unitId) || TryOpenViaEditorManager(app, unitId))
         {
             Post("OpenUnitResult", new { ok = true, error = (string?)null });
             return;
         }
 
-        // The Extensions API has no nanoflow type (10.24 through 11.12), so a nanoflow can be
-        // unreachable to it. Say where the document is instead of failing silently.
+        // Every way of opening failed (e.g. a future Studio Pro reshaped its internals). Say where
+        // the document is instead of failing silently.
         var (name, location) = Locate(app, unitId);
         Post("OpenUnitResult", new
         {
@@ -201,6 +201,90 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
             log.Warn($"Security Analyzer: opening {unitId} by name failed: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Opens a document the typed API has no type for — nanoflows, through 11.12 — the way Studio
+    /// Pro's own Changes pane does. <c>TryOpenEditor</c> only unwraps its argument to Studio Pro's
+    /// internal document and hands that to the editor manager's <c>EditDocument</c>; a nanoflow has
+    /// no typed wrapper to pass in, so this takes the internal document from the untyped unit and
+    /// calls <c>EditDocument</c> directly.
+    /// <para>
+    /// These are Studio Pro internals, found by shape rather than by name: the manager is whichever
+    /// field of the docking service has an <c>EditDocument</c> accepting the document (it is
+    /// <c>tabbedEditorManager</c> in 10.24 and <c>documentEditorManager</c> in 11.x). Any mismatch
+    /// returns false and the caller falls back to telling the user where the document is.
+    /// </para>
+    /// </summary>
+    private bool TryOpenViaEditorManager(IModel app, string unitId)
+    {
+        try
+        {
+            var unit = FindUntypedUnitObject(app, unitId);
+            var document = unit is null ? null : FieldValueOfType(unit, "IStorageObject");
+            if (document is null) return false;
+
+            foreach (var candidate in FieldValues(dockingWindows).Prepend(dockingWindows))
+            {
+                var editDocument = candidate.GetType().GetInterfaces().Prepend(candidate.GetType())
+                    .SelectMany(t => t.GetMethods())
+                    .FirstOrDefault(m => m.Name == "EditDocument"
+                        && m.GetParameters().Length is 1 or 2
+                        && m.GetParameters()[0].ParameterType.IsInstanceOfType(document)
+                        && m.GetParameters().Skip(1).All(p => !p.ParameterType.IsValueType || Nullable.GetUnderlyingType(p.ParameterType) is not null));
+                if (editDocument is null) continue;
+
+                var arguments = editDocument.GetParameters().Length == 1 ? new[] { document } : new[] { document, null };
+                editDocument.Invoke(candidate, arguments);
+                return true;
+            }
+            log.Warn("Security Analyzer: Studio Pro's editor manager was not found; cannot open the document directly.");
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: opening {unitId} through the editor manager failed: {ex.Message}");
+        }
+        return false;
+    }
+
+    private const System.Reflection.BindingFlags InstanceFields =
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+
+    /// <summary>The values of every instance field of <paramref name="target"/>, base classes included.</summary>
+    private static IEnumerable<object> FieldValues(object target)
+    {
+        for (var type = target.GetType(); type is not null; type = type.BaseType)
+        {
+            foreach (var field in type.GetFields(InstanceFields | System.Reflection.BindingFlags.DeclaredOnly))
+            {
+                var value = field.GetValue(target);
+                if (value is not null) yield return value;
+            }
+        }
+    }
+
+    /// <summary>The first instance field whose declared type is named <paramref name="typeName"/>.</summary>
+    private static object? FieldValueOfType(object target, string typeName)
+    {
+        for (var type = target.GetType(); type is not null; type = type.BaseType)
+        {
+            foreach (var field in type.GetFields(InstanceFields | System.Reflection.BindingFlags.DeclaredOnly))
+            {
+                if (field.FieldType.Name == typeName && field.GetValue(target) is { } value) return value;
+            }
+        }
+        return null;
+    }
+
+    private Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelUnit? FindUntypedUnitObject(IModel app, string unitId)
+    {
+        var root = untypedModel.GetUntypedModel(app);
+        foreach (var module in root.GetUnitsOfType("Projects$Module"))
+        {
+            var unit = module.GetUnits().FirstOrDefault(u => u.ID.ToString() == unitId);
+            if (unit is not null) return unit;
+        }
+        return null;
     }
 
     private static IEnumerable<Mendix.StudioPro.ExtensionsAPI.Model.Projects.IDocument> DocumentsOf(

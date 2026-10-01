@@ -209,7 +209,7 @@ Export tab offers *Extension name*; if not, use `install.ps1` per app.
 | `install.ps1` cannot copy the DLL | Close Studio Pro first. |
 | A rule is *Not applicable* | The Rules tab gives the reason — usually that the app has nothing to check (e.g. no published REST service). |
 | A result looks wrong | Every run saves what Studio Pro returned to `%LOCALAPPDATA%\Mendix Security Analyzer\last-snapshot.json` (passwords redacted). Studio Pro's own log records any failure to read or open a document. |
-| **Open** does not open a nanoflow | The extensions API has no nanoflow type in 10.24–11.12. The pane then tells you the nanoflow's place in the App Explorer and copies its name for the App Explorer search. |
+| **Open** shows a message instead of opening a nanoflow | The extensions API has no nanoflow type, so the extension opens nanoflows through Studio Pro's internal editor manager (verified on 10.24 and 11.12). If a Studio Pro version changes that, the pane tells you the nanoflow's place in the App Explorer and copies its name; the reason is in Studio Pro's log. |
 
 ---
 

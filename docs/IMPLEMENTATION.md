@@ -205,9 +205,14 @@ finding, then C below 75, B below 88, otherwise A.
    for entity findings, open the module's domain model with the entity passed as the element to
    focus;
 2. look the document up by name among its module's documents;
-3. if Studio Pro still cannot open it — the extensions API has no nanoflow type through 11.12 — tell
-   the user its App Explorer path (worked out from the folders that contain it) and copy its name
-   for the App Explorer search.
+3. for documents the typed API has no type for — **nanoflows**, through 11.12 — do what Studio Pro's
+   own Changes pane does. `TryOpenEditor` only unwraps its argument to Studio Pro's internal
+   document and passes it to the editor manager's `EditDocument`; a nanoflow has no typed wrapper,
+   so the host takes the internal document from the untyped unit and calls `EditDocument` itself
+   (by reflection, matched by shape: the manager is `tabbedEditorManager` in 10.24 and
+   `documentEditorManager` in 11.x);
+4. if all of that fails — a future Studio Pro reshaping those internals — tell the user the
+   document's App Explorer path and copy its name for the App Explorer search.
 
 ---
 
@@ -233,6 +238,8 @@ The reference-project suites need an unpacked Mendix app; see the README.
 - **SEC-MF-004** detects header checks by pattern; a custom check under another name can be missed.
 - An object retrieved **over an association** has no resolved entity, so SEC-MF-002 does not count a
   change to it.
-- **Nanoflows** cannot be opened directly through the extensions API; the pane gives their location.
+- **Nanoflows** are opened through Studio Pro internals (§6), because the extensions API has no
+  nanoflow type. If a future Studio Pro changes those internals, the pane falls back to giving their
+  location.
 - Studio Pro's App Security dialog remains the authority on its own *Complete / Incomplete* status;
   Module status explains this analyzer's own checks.
