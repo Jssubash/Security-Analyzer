@@ -18,6 +18,9 @@ import { looksQualified } from '@mendix-analyzer/application-ir';
 import { formatGuid } from '@mendix-analyzer/mendix-parser';
 import { ModelGraph } from '@mendix-analyzer/mendix-parser';
 
+import { javaLibrariesFromDisk } from './java-libraries-from-disk.mjs';
+import { widgetsFromDisk } from './widgets-from-disk.mjs';
+
 /** Unit types the host collects, by module and at project level. */
 export const MODULE_UNIT_TYPES = [
   'Security$ModuleSecurity',
@@ -28,6 +31,7 @@ export const MODULE_UNIT_TYPES = [
   'Rest$PublishedRestService',
   'Forms$Snippet',
   'Microflows$Nanoflow',
+  'Projects$ModuleSettings',
 ];
 export const PROJECT_UNIT_TYPES = ['Security$ProjectSecurity', 'Navigation$NavigationDocument'];
 
@@ -139,6 +143,9 @@ export function snapshotFromMprContents(projectRoot, mprPath, options = {}) {
   const modules = graph.modules.map((info) => ({
     name: info.name,
     fromAppStore: info.fromAppStore,
+    appStorePackageId: info.appStorePackageId ?? null,
+    appStoreVersion: info.appStoreVersion ?? null,
+    isThemeModule: info.isThemeModule,
     unitId: info.unitId,
     units: [],
   }));
@@ -173,6 +180,8 @@ export function snapshotFromMprContents(projectRoot, mprPath, options = {}) {
     projectUnits,
     modules,
     javaSources: javaSources(projectRoot),
+    javaLibraries: javaLibrariesFromDisk(projectRoot),
+    widgets: widgetsFromDisk(projectRoot),
     referenceIndex: options.withoutReferenceIndex ? undefined : referenceIndex(graph),
     notes: [],
     capturedAt: new Date(0).toISOString(),

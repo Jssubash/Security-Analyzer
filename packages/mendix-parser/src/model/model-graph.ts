@@ -15,7 +15,7 @@
 
 import { basename, dirname, join } from 'node:path';
 
-import { bool, str } from '../bson/accessors.js';
+import { bool, num, str } from '../bson/accessors.js';
 import { UnitIndex } from '../bson/unit-index.js';
 import type { UnitRef } from '../bson/unit-index.js';
 import { ContainmentReadError, ContainmentTree } from '../mpr/containment.js';
@@ -34,6 +34,8 @@ export interface ModuleInfo {
   readonly fromAppStore: boolean;
   readonly isThemeModule: boolean;
   readonly appStoreVersion?: string;
+  /** The Marketplace content id the module was installed from. */
+  readonly appStorePackageId?: number;
 }
 
 export interface ModelGraphDiagnostics {
@@ -147,6 +149,7 @@ export class ModelGraph {
         fromAppStore,
         isThemeModule: bool(tree, 'IsThemeModule') ?? false,
         appStoreVersion: appStoreVersion || undefined,
+        appStorePackageId: num(tree, 'AppStorePackageId') || undefined,
       };
       this.moduleByUnitId.set(ref.unitId, info);
       this.moduleByName.set(name, info);

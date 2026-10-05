@@ -5,3 +5,6 @@ export * from './snapshot/accessors.js';
 export * from './snapshot/build-ir.js';
 export * from './snapshot/types.js';
 export * from './module-status.js';
+export * from './java-libraries.js';
+export * from './marketplace.js';
+export * from './accepted-risks.js';

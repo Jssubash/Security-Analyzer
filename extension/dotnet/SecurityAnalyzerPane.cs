@@ -88,6 +88,38 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
                 case "ExportReport":
                     ExportReport(ReadString(args, "fileName"), ReadString(args, "content"));
                     break;
+                case "CheckVulnerabilities":
+                    CheckVulnerabilities(Field(args, "packages") as JsonArray, ReadString(args, "purpose") ?? "libraries");
+                    break;
+                case "AcceptRisk":
+                    ChangeAcceptedRisks(Field(args, "risk") as JsonObject, revoke: false);
+                    break;
+                case "RevokeRisk":
+                    ChangeAcceptedRisks(Field(args, "risk") as JsonObject, revoke: true);
+                    break;
+                case "MarketplaceTokenStatus":
+                    Post("MarketplaceTokenStatus", new { source = MarketplaceClient.AvailableToken(null).ToString() });
+                    break;
+                case "CheckMarketplace":
+                    CheckMarketplace(ReadString(args, "token"), Field(args, "remember") is JsonValue r && r.TryGetValue<bool>(out var keep) && keep,
+                        Field(args, "contentIds") as JsonArray, Field(args, "catalog") is JsonValue c && c.TryGetValue<bool>(out var wantCatalog) && wantCatalog);
+                    break;
+                case "ForgetMarketplaceToken":
+                    MarketplaceClient.Forget();
+                    Post("MarketplaceTokenStatus", new { source = MarketplaceClient.AvailableToken(null).ToString() });
+                    break;
+                case "OpenMarketplacePage":
+                    if (ReadInt(args, "contentId") is var contentId and > 0)
+                    {
+                        Process.Start(new ProcessStartInfo($"https://marketplace.mendix.com/link/component/{contentId}") { UseShellExecute = true });
+                    }
+                    break;
+                case "OpenLibraryFolder":
+                    OpenLibraryFolder(ReadString(args, "folder"), ReadString(args, "fileName"));
+                    break;
+                case "OpenAdvisory":
+                    OpenAdvisory(ReadString(args, "id"));
+                    break;
                 case "AnalysisComplete":
                     var failures = ReadInt(args, "failures");
                     BadgeValue = failures;
@@ -98,6 +130,229 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         catch (Exception ex)
         {
             log.Error($"Security Analyzer: handling '{args.Message}' failed", ex);
+        }
+    }
+
+    private CancellationTokenSource? vulnerabilityCheck;
+
+    /// <summary>
+    /// Looks the app's Java libraries up in OSV.dev (see <see cref="OsvClient"/>), off the UI
+    /// thread, and posts the answer back on the thread the request came in on.
+    /// </summary>
+    private void CheckVulnerabilities(JsonArray? packages, string purpose)
+    {
+        if (packages is null || packages.Count == 0)
+        {
+            Post("VulnerabilityResult", new { ok = false, purpose, error = "There are no libraries with known names and versions to check." });
+            return;
+        }
+        vulnerabilityCheck?.Cancel();
+        var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+        vulnerabilityCheck = cancel;
+        var context = SynchronizationContext.Current;
+        var request = (JsonArray)packages.DeepClone();
+        void Reply(object data)
+        {
+            if (context is null) Post("VulnerabilityResult", data);
+            else context.Post(_ => Post("VulnerabilityResult", data), null);
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                var watch = Stopwatch.StartNew();
+                var result = await new OsvClient().CheckAsync(request, cancel.Token);
+                log.Info($"Security Analyzer: checked {request.Count} {purpose} packages against OSV.dev in {watch.ElapsedMilliseconds} ms");
+                Reply(new { ok = true, purpose, json = result.ToJsonString() });
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Security Analyzer: the vulnerability check failed: {ex.Message}");
+                var reason = ex is TaskCanceledException or OperationCanceledException
+                    ? "the check timed out"
+                    : ex is HttpRequestException ? $"OSV.dev could not be reached ({ex.Message})" : ex.Message;
+                Reply(new { ok = false, purpose, error = $"The vulnerability check failed: {reason}. Check the internet connection or proxy and try again." });
+            }
+        });
+    }
+
+    /// <summary>Records or revokes an accepted-risk decision in the app folder; see <see cref="AcceptedRiskStore"/>.</summary>
+    private void ChangeAcceptedRisks(JsonObject? risk, bool revoke)
+    {
+        var directory = currentApp()?.Root.DirectoryPath;
+        if (string.IsNullOrEmpty(directory) || risk is null)
+        {
+            Post("AcceptedRisks", new { ok = false, error = "The app directory is not known, so the decision cannot be saved." });
+            return;
+        }
+        try
+        {
+            var result = revoke ? AcceptedRiskStore.Revoke(directory, risk) : AcceptedRiskStore.Accept(directory, risk);
+            log.Info($"Security Analyzer: {(revoke ? "revoked" : "recorded")} an accepted risk in {AcceptedRiskStore.RelativePath}");
+            Post("AcceptedRisks", new { ok = true, json = result.ToJsonString() });
+        }
+        catch (Exception ex)
+        {
+            Post("AcceptedRisks", new { ok = false, error = ex is ArgumentException ? ex.Message : $"{AcceptedRiskStore.RelativePath} could not be updated: {ex.Message}" });
+        }
+    }
+
+    private CancellationTokenSource? marketplaceCheck;
+
+    /// <summary>
+    /// Fetches version histories (and, for widget matching, the catalog) from the Marketplace
+    /// Content API off the UI thread; see <see cref="MarketplaceClient"/> for what is sent and how
+    /// the token is kept. The token itself never goes back to the pane.
+    /// </summary>
+    private void CheckMarketplace(string? typedToken, bool remember, JsonArray? contentIds, bool catalog)
+    {
+        MarketplaceClient? client;
+        try
+        {
+            client = MarketplaceClient.Create(typedToken, remember);
+        }
+        catch (Exception ex)
+        {
+            Post("MarketplaceResult", new { ok = false, error = $"The token could not be stored: {ex.Message}" });
+            return;
+        }
+        if (client is null)
+        {
+            Post("MarketplaceResult", new { ok = false, needsToken = true, error = "A Mendix Personal Access Token is needed to read version information from the Marketplace." });
+            return;
+        }
+        var ids = (contentIds ?? new JsonArray())
+            .Select(n => n is JsonValue v && v.TryGetValue<int>(out var i) ? i : 0)
+            .Where(i => i > 0).Distinct().ToList();
+
+        marketplaceCheck?.Cancel();
+        var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        marketplaceCheck = cancel;
+        var context = SynchronizationContext.Current;
+        var source = MarketplaceClient.AvailableToken(typedToken).ToString();
+        void Reply(object data)
+        {
+            if (context is null) Post("MarketplaceResult", data);
+            else context.Post(_ => Post("MarketplaceResult", data), null);
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                var watch = Stopwatch.StartNew();
+                var versions = new JsonObject();
+                using var gate = new SemaphoreSlim(6);
+                var fetched = await Task.WhenAll(ids.Select(async id =>
+                {
+                    await gate.WaitAsync(cancel.Token);
+                    try
+                    {
+                        return (id, list: (JsonNode?)await client.VersionsAsync(id, cancel.Token), error: (string?)null);
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        return (id, list: (JsonNode?)null, error: (string?)ex.Message);
+                    }
+                    finally
+                    {
+                        gate.Release();
+                    }
+                }));
+                var failures = new JsonObject();
+                foreach (var (id, list, error) in fetched)
+                {
+                    if (list is not null) versions[id.ToString()] = list;
+                    else failures[id.ToString()] = error;
+                }
+                var result = new JsonObject
+                {
+                    ["checkedAt"] = DateTime.UtcNow.ToString("o"),
+                    ["versions"] = versions,
+                    ["failures"] = failures,
+                };
+                if (catalog) result["catalog"] = await client.CatalogAsync(cancel.Token);
+                log.Info($"Security Analyzer: read {ids.Count} Marketplace version lists{(catalog ? " and the catalog" : "")} in {watch.ElapsedMilliseconds} ms");
+                Reply(new { ok = true, json = result.ToJsonString(), tokenSource = source });
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                if (remember) MarketplaceClient.Forget();
+                Reply(new { ok = false, needsToken = true, error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Security Analyzer: the Marketplace check failed: {ex.Message}");
+                var reason = ex is TaskCanceledException or OperationCanceledException ? "the check timed out" : ex.Message;
+                Reply(new { ok = false, error = $"The Marketplace could not be read: {reason}. Check the internet connection or proxy and try again." });
+            }
+        });
+    }
+
+    /// <summary>
+    /// Shows a jar in Windows Explorer, selected in its folder — what Studio Pro's own
+    /// App ▸ Show App Directory in Explorer does for the app directory, which the extensions API
+    /// gives as <c>IProject.DirectoryPath</c>. The path is built here from that directory: the pane
+    /// only names <c>userlib</c>, <c>vendorlib</c> or <c>widgets</c> and a file name, and anything that would
+    /// resolve outside those folders is refused.
+    /// </summary>
+    private void OpenLibraryFolder(string? folder, string? fileName)
+    {
+        try
+        {
+            var directory = currentApp()?.Root.DirectoryPath;
+            if (string.IsNullOrEmpty(directory) || folder is not ("userlib" or "vendorlib" or "widgets"))
+            {
+                Post("OpenFolderResult", new { ok = false, error = "The app directory is not known." });
+                return;
+            }
+            var libraryFolder = Path.GetFullPath(Path.Combine(directory, folder));
+            if (!Directory.Exists(libraryFolder))
+            {
+                Post("OpenFolderResult", new { ok = false, error = $"{folder} does not exist in the app directory any more." });
+                return;
+            }
+
+            string arguments;
+            var valid = !string.IsNullOrEmpty(fileName) && fileName == Path.GetFileName(fileName)
+                && fileName.EndsWith(folder == "widgets" ? ".mpk" : ".jar", StringComparison.OrdinalIgnoreCase);
+            var file = valid ? Path.GetFullPath(Path.Combine(libraryFolder, fileName!)) : null;
+            if (file is not null && file.StartsWith(libraryFolder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) && File.Exists(file))
+            {
+                arguments = $"/select,\"{file}\"";
+            }
+            else
+            {
+                // The jar is gone (synchronised away, deleted): open its folder instead.
+                arguments = $"\"{libraryFolder}\"";
+                Post("OpenFolderResult", new { ok = true, error = (string?)$"{fileName} is no longer in {folder}; opened the folder instead." });
+            }
+            Process.Start(new ProcessStartInfo("explorer.exe", arguments) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: could not open the folder of {folder}/{fileName}: {ex.Message}");
+            Post("OpenFolderResult", new { ok = false, error = $"Windows Explorer could not be opened: {ex.Message}" });
+        }
+    }
+
+    /// <summary>Opens an advisory's osv.dev page in the default browser. Only osv.dev pages, built from the id.</summary>
+    private void OpenAdvisory(string? id)
+    {
+        var page = OsvClient.AdvisoryPage(id);
+        if (page is null) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(page.AbsoluteUri) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: could not open {page}: {ex.Message}");
         }
     }
 

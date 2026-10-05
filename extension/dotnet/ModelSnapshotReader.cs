@@ -31,6 +31,8 @@ internal sealed class ModelSnapshotReader
         "PublishedRestService",
         "Snippet",
         "Nanoflow",
+        // Each module's declared Java dependencies (JarDependencies), for the Java libraries tab.
+        "ModuleSettings",
     };
 
     /// <summary>
@@ -133,6 +135,9 @@ internal sealed class ModelSnapshotReader
             ["projectUnits"] = projectUnits,
             ["modules"] = modules,
             ["javaSources"] = ReadJavaSources(directory),
+            ["javaLibraries"] = JavaLibraryScanner.Read(directory, notes),
+            ["widgets"] = WidgetScanner.Read(directory, notes),
+            ["acceptedRisks"] = AcceptedRiskStore.Read(directory),
             ["referenceIndex"] = referenceIndex,
             ["notes"] = new JsonArray(notes.Select(n => (JsonNode?)JsonValue.Create(n)).ToArray()),
             ["diagnostics"] = new JsonObject
@@ -175,6 +180,12 @@ internal sealed class ModelSnapshotReader
         {
             ["name"] = name,
             ["fromAppStore"] = PropertyValue(module, "fromAppStore") is bool b ? b : null,
+            // What the Marketplace installed: its content id and version, for the Upgrades tab.
+            ["appStorePackageId"] = FirstValue(module, "appStorePackageId", "AppStorePackageId") is { } packageId
+                && int.TryParse(System.Convert.ToString(packageId, System.Globalization.CultureInfo.InvariantCulture), out var id) && id > 0 ? id : null,
+            ["appStoreVersion"] = NonEmpty(FirstValue(module, "appStoreVersion", "AppStoreVersion") as string),
+            ["appStoreVersionGuid"] = NonEmpty(System.Convert.ToString(FirstValue(module, "appStoreVersionGuid", "AppStoreVersionGuid"))),
+            ["isThemeModule"] = FirstValue(module, "isThemeModule", "IsThemeModule") is bool theme ? theme : null,
             ["unitId"] = module.ID.ToString(),
             ["units"] = units,
         };
@@ -428,6 +439,17 @@ internal sealed class ModelSnapshotReader
     }
 
     private static string? AsString(object? value) => value as string;
+
+    private static object? FirstValue(IModelStructure structure, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (PropertyValue(structure, name) is { } value) return value;
+        }
+        return null;
+    }
+
+    private static string? NonEmpty(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static string Normalise(string type) =>
         type.EndsWith("Impl", StringComparison.Ordinal) ? type[..^4] : type;

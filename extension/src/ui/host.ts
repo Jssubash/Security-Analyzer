@@ -13,7 +13,12 @@ export type HostMessage =
   | { message: 'Snapshot'; data: { json: string } }
   | { message: 'SnapshotFailed'; data: { error: string } }
   | { message: 'ExportDone'; data: { path?: string; error?: string } }
-  | { message: 'OpenUnitResult'; data: { ok: boolean; error?: string; name?: string; location?: string } };
+  | { message: 'OpenUnitResult'; data: { ok: boolean; error?: string; name?: string; location?: string } }
+  | { message: 'VulnerabilityResult'; data: { ok: boolean; json?: string; error?: string; purpose?: string } }
+  | { message: 'OpenFolderResult'; data: { ok: boolean; error?: string } }
+  | { message: 'AcceptedRisks'; data: { ok: boolean; json?: string; error?: string } }
+  | { message: 'MarketplaceTokenStatus'; data: { source: 'None' | 'Typed' | 'Remembered' | 'Environment' } }
+  | { message: 'MarketplaceResult'; data: { ok: boolean; json?: string; error?: string; needsToken?: boolean; tokenSource?: string } };
 
 type Handler = (msg: HostMessage) => void;
 

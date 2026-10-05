@@ -20,6 +20,11 @@ dockable pane that does all of the analysis.
  │   SecurityAnalyzerWebServer   serves index.html / app.js / app.css   │
  │   ModelSnapshotReader         untyped model API → JSON snapshot      │
  │   SecretRedactor              passwords → length + character classes │
+ │   JavaLibraryScanner          jars, poms, SBOM, .RequiredLib markers │
+ │   WidgetScanner               widget packages and bundled libraries  │
+ │   OsvClient                   OSV.dev lookups (Maven, npm)           │
+ │   MarketplaceClient           Marketplace Content API, token (DPAPI) │
+ │   AcceptedRiskStore           .security-analyzer/accepted-risks.json │
  └───────────────▲──────────────────────────────┬───────────────────────┘
                  │ RunAnalysis, OpenUnit,       │ Snapshot (JSON),
                  │ ExportReport, …              │ OpenUnitResult, ExportDone
@@ -216,7 +221,67 @@ finding, then C below 75, B below 88, otherwise A.
 
 ---
 
-## 7. Testing
+## 7. Java libraries
+
+`JavaLibraryScanner.cs` lists every jar in `userlib/` and `vendorlib/` with its SHA-256, the
+`pom.properties` inside it (its own and those of libraries shaded into it) and identifying manifest
+attributes; the `.RequiredLib` markers in `userlib`; and `vendorlib/vendorlib-sbom.json` (CycloneDX)
+reduced to coordinates and the dependency graph. Each module's declared Java dependencies come from
+its `Projects$ModuleSettings.JarDependencies`.
+
+`java-libraries.ts` identifies each jar (SBOM by hash, then pom, manifest, file name), walks the SBOM
+graph from each module's declarations to say which module needs which jar (directly or through
+another library), and classifies it: **Marketplace** when a Marketplace module needs it, **custom**
+otherwise. **Duplicates** are grouped by library name with the version stripped, never by version.
+
+The vulnerability check sends Maven coordinates to OSV.dev (`OsvClient.cs`, `querybatch` then each
+advisory, cached by id and modification time). Severity comes from the advisory's database rating,
+else its CVSS v3 base score; the fix is the lowest fixed version above the one in use; the advice
+depends on who owns the library.
+
+---
+
+## 8. Upgrades
+
+The snapshot carries each module's `AppStorePackageId` (Marketplace content id) and
+`AppStoreVersion`, and `WidgetScanner.cs` reads every `widgets/*.mpk`: `<clientModule name
+version>` from `package.xml`, each widget's id, name and platform, and the bundled npm libraries from
+`dependencies.json` (with `dependencies.txt` only as a fallback). Native widgets flag each library
+`transitive: true/false`; only direct libraries count, because the indirect ones include the widget
+build toolchain.
+
+`MarketplaceClient.cs` reads the Content API (`/v1/content/{id}/versions`, paged at the API's own
+page size until a page is empty; `/v1/content` for the catalog) with the user's Personal Access
+Token (`Authorization: MxToken …`), taken from the pane, a DPAPI-encrypted file, or `MENDIX_PAT`. It
+never returns the token to the pane.
+
+`marketplace.ts` decides per item, for a target Mendix version: the **recommended** version is the
+newest whose minimum Mendix version is at or below the target. The Marketplace publishes no maximum,
+so a release built for an older major line is *update recommended*, not *incompatible*; an installed
+release that needs a newer Mendix than the target is *incompatible*. A version list that stops short
+of the installed version is reported as incomplete rather than as "no compatible version". Widgets
+that ship inside a module (Native Mobile Resources for `com.mendix.widget.native.*`, Data Widgets
+for the Datagrid family, a module shipping a widget of its own name and version) follow the module.
+
+---
+
+## 9. Accepted risks
+
+A decision (`accepted-risks.ts`) covers one advisory in one library version in one place — a Java
+library by `folder/fileName`, or a widget package by file name — and records the reason, who, when
+and a review-by date. `splitByAcceptance` moves accepted advisories out of the open list until the
+review date; after it, they count again and are flagged overdue. A changed library version no longer
+matches.
+
+`AcceptedRiskStore.cs` keeps them in `.security-analyzer/accepted-risks.json` in the app folder so they
+are committed and reviewed with the app. It validates each decision (reason length, review date in
+the future and within a year), stamps `acceptedBy` with the Windows user name and `acceptedAt` with
+the clock so neither can be supplied by the pane, writes atomically, and refuses to overwrite a file
+it cannot parse.
+
+---
+
+## 10. Testing
 
 | Suite | What it proves |
 |---|---|
@@ -232,12 +297,17 @@ The reference-project suites need an unpacked Mendix app; see the README.
 
 ---
 
-## 8. Known limitations
+## 11. Known limitations
 
 - Published **OData** services, scheduled-event settings and consumed services are not read.
 - **SEC-MF-004** detects header checks by pattern; a custom check under another name can be missed.
 - An object retrieved **over an association** has no resolved entity, so SEC-MF-002 does not count a
   change to it.
+- The Marketplace does not publish which libraries a widget release bundles, so the secure-version
+  suggestion for a vulnerable widget is the newest release for the Mendix version, to be confirmed in
+  its release notes.
+- Standalone widgets are matched to the Marketplace by name; an ambiguous or unknown name is shown as
+  *Not on Marketplace* rather than guessed.
 - **Nanoflows** are opened through Studio Pro internals (§6), because the extensions API has no
   nanoflow type. If a future Studio Pro changes those internals, the pane falls back to giving their
   location.

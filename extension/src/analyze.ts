@@ -13,6 +13,10 @@ import { securityRules } from '@mendix-analyzer/rules';
 import { ScoringEngine } from '@mendix-analyzer/scoring';
 import type { ScoreReport } from '@mendix-analyzer/scoring';
 
+import { buildJavaLibraryReport } from './java-libraries.js';
+import type { JavaLibraryReport } from './java-libraries.js';
+import { buildUpgradeInventory } from './marketplace.js';
+import type { UpgradeInventory } from './marketplace.js';
 import { buildModuleStatus } from './module-status.js';
 import type { ModuleStatus } from './module-status.js';
 import { buildIrFromSnapshot } from './snapshot/build-ir.js';
@@ -57,6 +61,10 @@ export interface SecurityAnalysisResult {
   entityNames: string[];
   /** Per-module security status, for the Module status tab. */
   modules: ModuleStatus[];
+  /** The jars in userlib and vendorlib, split into Marketplace and custom, for the Java libraries tab. */
+  javaLibraries: JavaLibraryReport;
+  /** Marketplace modules and widgets with their installed versions, for the Upgrades tab. */
+  upgrades: UpgradeInventory;
   inventory: {
     modules: number;
     userModules: number;
@@ -140,6 +148,7 @@ export function analyzeSnapshot(
 
   const unassessed = score.unassessedCategories.find((c) => c.category === 'Security');
   const moduleList = Object.values(ir.modules);
+  const moduleTypes = Object.fromEntries(moduleList.map((m) => [m.name, m.type]));
 
   return {
     app: {
@@ -156,9 +165,11 @@ export function analyzeSnapshot(
     coverage: ir.coverage,
     units,
     diagnostics,
-    moduleTypes: Object.fromEntries(moduleList.map((m) => [m.name, m.type])),
+    moduleTypes,
     entityNames: Object.keys(ir.entities),
     modules: buildModuleStatus(ir, nanoflows, findings, flowReferences),
+    javaLibraries: buildJavaLibraryReport(snapshot, moduleTypes),
+    upgrades: buildUpgradeInventory(snapshot),
     inventory: {
       modules: moduleList.length,
       userModules: moduleList.filter((m) => m.type === 'user').length,
