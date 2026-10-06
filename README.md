@@ -1,6 +1,6 @@
 # Mendix Security Analyzer
 
-A Mendix Studio Pro extension that checks the app you have open against **35 security governance
+A Mendix Studio Pro extension that checks the app you have open against **34 security governance
 rules**: project security, anonymous access, entity and page access, role hygiene, credentials,
 constants and microflow security. Findings explain what was found, why it matters and how to fix it,
 and link straight to the document in Studio Pro.
@@ -69,7 +69,6 @@ For how it is built — architecture, data flow and how each rule is detected �
 | `SEC-023` | User role bypasses security | High | Role Hygiene |
 | `SEC-024` | Non-administrator user role can manage all roles | Medium | Role Hygiene |
 | `SEC-025` | Module role not mapped to any user role | Low | Role Hygiene |
-| `SEC-007` | Regex-based XSS sanitiser in a Java action | High | Input Sanitization |
 | `SEC-026` | Hardcoded secret in a constant | High | Credentials |
 | `SEC-027` | Secret-bearing constant exposed to the client | Critical | Credentials |
 | `SEC-010` | Form data cached in browser localStorage | Low | Data Privacy |
@@ -179,8 +178,18 @@ Marketplace modules), **Advisory checks** (also run the two rules that are off b
 
 ### Rules tab
 
-All 35 rules grouped by area, each marked **Passed**, **Failed**, **Review**, **Not applicable**
-(with the reason, e.g. the app publishes no REST services) or **Off**.
+All 34 rules grouped by area, each marked **Passed**, **Failed**, **Review**, **Not applicable**
+(with the reason, e.g. the app publishes no REST services), **Not verified** or **Off**.
+
+Click a rule to expand exactly what it validates: where in Studio Pro it looks, each condition that
+reports a finding, what it deliberately leaves alone, why it matters and how to fix it.
+
+**Not verified** means a value the rule depends on (a flag, a role list, a password policy setting)
+could not be read from the open app. Finding nothing in a value that was never read proves nothing,
+so the rule is not counted as a pass and is left out of the score.
+
+SEC-007 (regex-based XSS sanitiser in a Java action) is not run by the extension: pattern matching on
+Java source cannot tell a sanitiser from any other regular expression.
 
 ### Module status tab
 
@@ -308,6 +317,7 @@ Export tab offers *Extension name*; if not, use `install.ps1` per app.
 | No **Extensions ▸ SecurityAnalyzer** menu | Start Studio Pro with `--enable-extension-development`; check `extensions\SecurityAnalyzer\manifest.json` exists; check Smart App Control. |
 | `install.ps1` cannot copy the DLL | Close Studio Pro first. |
 | A rule is *Not applicable* | The Rules tab gives the reason — usually that the app has nothing to check (e.g. no published REST service). |
+| A rule is *Not verified* | The reason names the value Studio Pro did not return. Run again; if it persists, send `last-snapshot.json` (below). |
 | A result looks wrong | Every run saves what Studio Pro returned to `%LOCALAPPDATA%\Mendix Security Analyzer\last-snapshot.json` (passwords redacted). Studio Pro's own log records any failure to read or open a document. |
 | Compatibility check says the token was refused | The token expired, or was created without the Marketplace content read scope. Create a new one; a remembered token that is refused is forgotten. |
 | A vulnerability or Marketplace check fails | The machine needs internet access to api.osv.dev / marketplace-api.mendix.com (Studio Pro's proxy settings apply). The message on the tab names the reason. |

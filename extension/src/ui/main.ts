@@ -384,6 +384,7 @@ function summary(result: SecurityAnalysisResult): HTMLElement {
       fact('Rules passed', `${counts.PASSED ?? 0} of ${result.rules.length}`),
       fact('Failed / warnings', `${counts.FAILED ?? 0} / ${counts.WARNING ?? 0}`),
       fact('Not applicable', String(counts.NOT_APPLICABLE ?? 0)),
+      ...(counts.NOT_VERIFIED ? [fact('Not verified', String(counts.NOT_VERIFIED))] : []),
       fact('Coverage', `${score.coveragePercentage}%`)
     )
   );
@@ -614,6 +615,7 @@ const STATUS_LABEL: Record<RuleOutcome['status'], string> = {
   FAILED: 'Failed',
   WARNING: 'Review',
   NOT_APPLICABLE: 'Not applicable',
+  NOT_VERIFIED: 'Not verified',
   DISABLED: 'Off',
 };
 
@@ -628,30 +630,67 @@ function rulesView(result: SecurityAnalysisResult): HTMLElement {
     'section',
     { class: 'panel' },
     tabIntro(
-      'Every security rule the analyzer checks, grouped by area, with its result for this app: Passed, Failed, Review (needs judgement), Not applicable (the app has nothing to check, with the reason) or Off (advisory rules, enabled from the Findings tab).'
+      'Every security rule the analyzer checks, grouped by area, with its result for this app. Click a rule to see exactly what it checks, when it reports and what it leaves alone. Results: Passed, Failed, Review (needs judgement), Not applicable (the app has nothing to check, with the reason), Not verified (a setting the rule needs could not be read from this app, so it is not counted as a pass) or Off (advisory rules, enabled from the Findings tab).'
     ),
     [...groups].map(([group, rules]) =>
       h(
         'div',
         { class: 'rule-group' },
         h('h3', {}, group),
-        rules.map((r) =>
-          h(
-            'div',
-            { class: `rule-row st-${r.status.toLowerCase()}` },
-            h('span', { class: 'rule-status' }, statusIcon(r.status), STATUS_LABEL[r.status]),
-            h(
-              'div',
-              { class: 'rule-main' },
-              h('div', {}, h('span', { class: 'rule-id' }, r.id), ' ', r.name),
-              h('div', { class: 'muted small' }, r.reason ?? r.description)
-            ),
-            h('span', { class: `sev-badge sev-${r.severity.toLowerCase()}` }, r.severity),
-            h('span', { class: 'rule-count' }, r.findingCount > 0 ? String(r.findingCount) : '')
-          )
-        )
+        rules.map((r) => ruleRow(r))
       )
     )
+  );
+}
+
+/** One rule: a clickable summary line that expands to what exactly the rule validates. */
+function ruleRow(r: RuleOutcome): HTMLElement {
+  const key = `rule:${r.id}`;
+  const open = state.expanded.has(key);
+  const row = h(
+    'div',
+    { class: `rule-item st-${r.status.toLowerCase()}${open ? ' open' : ''}` },
+    h(
+      'button',
+      {
+        class: 'rule-row',
+        'aria-expanded': open ? 'true' : 'false',
+        title: open ? 'Hide what this rule checks' : 'Show what this rule checks',
+        onclick: () => {
+          if (state.expanded.has(key)) state.expanded.delete(key);
+          else state.expanded.add(key);
+          row.replaceWith(ruleRow(r));
+        },
+      },
+      h('span', { class: 'rule-status' }, statusIcon(r.status), STATUS_LABEL[r.status]),
+      h(
+        'span',
+        { class: 'rule-main' },
+        h('span', { class: 'rule-name' }, h('span', { class: 'rule-id' }, r.id), ' ', r.name),
+        // The status reason stays visible: it explains the result, not the rule.
+        r.reason ? h('span', { class: 'muted small rule-reason' }, r.reason) : null
+      ),
+      h('span', { class: `sev-badge sev-${r.severity.toLowerCase()}` }, r.severity),
+      h('span', { class: 'rule-count' }, r.findingCount > 0 ? String(r.findingCount) : ''),
+      chevronIcon()
+    ),
+    open ? ruleDetails(r) : null
+  );
+  return row;
+}
+
+function ruleDetails(r: RuleOutcome): HTMLElement {
+  const list = (items: string[]) => h('ul', { class: 'rule-list' }, items.map((i) => h('li', {}, i)));
+  const c = r.checks;
+  return h(
+    'div',
+    { class: 'details rule-details' },
+    detail('Rule', r.description),
+    c ? h('div', { class: 'detail' }, h('div', { class: 'label' }, 'What it checks in this app'), h('div', {}, c.reads)) : null,
+    c && c.flagged.length > 0 ? h('div', { class: 'detail' }, h('div', { class: 'label' }, 'Reported when'), list(c.flagged)) : null,
+    c && c.notFlagged.length > 0 ? h('div', { class: 'detail' }, h('div', { class: 'label' }, 'Not reported'), list(c.notFlagged)) : null,
+    detail('Why it matters', r.whyItMatters),
+    detail('How to fix', r.recommendation)
   );
 }
 

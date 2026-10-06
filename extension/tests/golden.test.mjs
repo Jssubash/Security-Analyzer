@@ -31,7 +31,6 @@ const EXPECTED = [
   'SEC-EE-003-NanoflowCommons.Position#1 | WARNING | Medium',
   'SEC-006-Atlas_Web_Content.User | WARNING | Medium',
   'SEC-006-MyFirstModule.User | FAIL | Critical',
-  'SEC-007-FeedbackModule.XSS_Sanitizer | WARNING | Medium',
   'SEC-012-enabled | FAIL | High',
   'SEC-013-demo_administrator | FAIL | High',
   'SEC-013-demo_user | FAIL | High',
@@ -49,7 +48,8 @@ const EXPECTED = [
   // SEC-MF rules read microflow bodies and the reference index, which only the extension extracts.
   'SEC-MF-001-Administration.ShowMyPasswordForm | WARNING | High',
   'SEC-MF-001-Atlas_Core.DS_Account_CurrentUser | WARNING | High',
-  'SEC-MF-003-FeedbackModule.SUB_Feedback_SendToServer.Feedback | WARNING | Medium',
+  // SEC-MF-003 is quiet: SUB_Feedback_SendToServer only changes its non-persistable Feedback
+  // parameter itself and writes none of its values into stored data.
 ];
 
 /** Rules the parser path skips (it does not read microflow bodies or the reference index). */
@@ -118,7 +118,7 @@ describeFixture('Security Analyzer extension on the reference project', () => {
   test('skips SEC-004 because the app publishes no REST service, and says why', () => {
     const sec004 = run().rules.find((r) => r.id === 'SEC-004');
     assert.equal(sec004.status, 'NOT_APPLICABLE');
-    assert.match(sec004.reason, /publishedServices/);
+    assert.match(sec004.reason, /publishes no REST services/);
   });
 
   test('keeps the advisory rules switched off by default', () => {
@@ -129,9 +129,10 @@ describeFixture('Security Analyzer extension on the reference project', () => {
     assert.deepEqual(disabled, ['SEC-008', 'SEC-009']);
   });
 
-  test('reports all 35 rules with a status', () => {
+  test('reports all 34 rules with a status, without SEC-007', () => {
     const { rules } = run();
-    assert.equal(rules.length, 35);
+    assert.equal(rules.length, 34);
+    assert.ok(!rules.some((r) => r.id === 'SEC-007'), 'SEC-007 is not run by the extension');
     for (const r of rules) assert.ok(r.status, `${r.id} has no status`);
   });
 
@@ -148,7 +149,6 @@ describeFixture('Security Analyzer extension on the reference project', () => {
     const { unitForFinding } = await import('../dist/analyzer.cjs');
     const result = run();
     for (const f of result.findings) {
-      if (f.ruleId === 'SEC-007') continue; // anchored to a .java file, not a model unit
       assert.ok(unitForFinding(f, result.units), `no unit for ${f.id} (${f.evidence.artifactPath})`);
     }
   });
@@ -192,7 +192,7 @@ describeFixture('SEC-MF rules on the reference project', () => {
     assert.deepEqual(status, {
       'SEC-MF-001': 'WARNING',
       'SEC-MF-002': 'PASSED',
-      'SEC-MF-003': 'WARNING',
+      'SEC-MF-003': 'PASSED',
       // TestApp publishes no REST service, so there is no endpoint to judge.
       'SEC-MF-004': 'NOT_APPLICABLE',
       'SEC-MF-005': 'PASSED',

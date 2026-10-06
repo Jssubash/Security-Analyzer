@@ -87,7 +87,7 @@ export function extractSecurity(graph: ModelGraph): SecurityExtraction {
 
   const passwordPolicy = extractPasswordPolicy(doc, notes);
   const guestRoleName = str(doc, 'GuestUserRole');
-  const userRoles = extractUserRoles(doc, guestRoleName, notes);
+  const userRoles = extractUserRoles(doc, guestRoleName, str(doc, 'AdminUserRole'), notes);
   const administrator = extractAdministrator(doc, passwordPolicy, notes);
   const demoUsers = extractDemoUsers(doc);
 
@@ -164,6 +164,7 @@ function extractModuleRoles(graph: ModelGraph): Extraction<ModuleRole[]> {
 function extractUserRoles(
   doc: BsonDocument,
   guestRoleName: string | undefined,
+  adminRoleName: string | undefined,
   notes: string[]
 ): UserRole[] {
   const raw = docArray(doc, 'UserRoles');
@@ -194,9 +195,10 @@ function extractUserRoles(
       moduleRoles: grants,
       manageableRoles: strArray(role, 'ManageableRoles'),
       isAnonymous: guestRoleName !== undefined && name === guestRoleName,
-      // An administrator is identified by what it can do, not by being called "Admin":
-      // `ManageAllRoles` lets it grant any role to any user, including itself.
-      isAdministrator: (bool(role, 'ManageAllRoles') ?? false) || /^admin/i.test(name),
+      // The administrator role is the one App Security names for MxAdmin, or one named for it.
+      // Not `ManageAllRoles`: SEC-024 asks which non-administrator roles hold that right, and
+      // defining administrators by it made the rule impossible to fail.
+      isAdministrator: name === adminRoleName || /^admin/i.test(name),
       manageAllRoles: bool(role, 'ManageAllRoles'),
       manageUsersWithoutRoles: bool(role, 'ManageUsersWithoutRoles'),
       checkSecurity: bool(role, 'CheckSecurity'),

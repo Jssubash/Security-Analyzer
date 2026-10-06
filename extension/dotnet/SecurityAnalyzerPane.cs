@@ -479,6 +479,10 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
             var document = unit is null ? null : FieldValueOfType(unit, "IStorageObject");
             if (document is null) return false;
 
+            // Studio Pro's own opener first: it shows dialog-style documents (App Security, …) as
+            // their dialog and everything else in a tab, which is what the Errors pane uses.
+            if (TryOpenWithDocumentViewManager(document, unitId)) return true;
+
             foreach (var candidate in FieldValues(dockingWindows).Prepend(dockingWindows))
             {
                 var editDocument = candidate.GetType().GetInterfaces().Prepend(candidate.GetType())
@@ -497,9 +501,59 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         }
         catch (Exception ex)
         {
-            log.Warn($"Security Analyzer: opening {unitId} through the editor manager failed: {ex.Message}");
+            log.Warn($"Security Analyzer: opening {unitId} through the editor manager failed: {Reason(ex)}");
         }
         return false;
+    }
+
+    /// <summary>
+    /// Opens a document through Studio Pro's <c>IDocumentViewManager.EditDocument</c>, resolved from
+    /// Studio Pro's service locator. In 10.x this is the opener that knows which documents have a
+    /// modal editor — App Security is a dialog, not a tab — while the docking service only reaches
+    /// the tab manager, which throws for them. In 11.x the interface no longer opens documents and
+    /// the method is absent, so this returns false and the editor manager (which handles dialogs
+    /// there) is used instead.
+    /// </summary>
+    private bool TryOpenWithDocumentViewManager(object document, string unitId)
+    {
+        try
+        {
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            var locator = assemblies.Select(a => a.GetType("Mendix.Modeler.Utility.DIContainer.ServiceLocator", throwOnError: false)).FirstOrDefault(t => t is not null);
+            var viewManagerType = assemblies.Select(a => a.GetType("Mendix.Modeler.Common.IDocumentViewManager", throwOnError: false)).FirstOrDefault(t => t is not null);
+            var editDocument = viewManagerType?.GetMethods().FirstOrDefault(m => m.Name == "EditDocument" && m.GetParameters().Length is 1 or 2);
+            var resolve = locator?.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+                .FirstOrDefault(m => m.Name == "ObsoleteResolve" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+            if (viewManagerType is null || editDocument is null || resolve is null) return false;
+            if (!editDocument.GetParameters()[0].ParameterType.IsInstanceOfType(document)) return false;
+
+            var viewManager = resolve.MakeGenericMethod(viewManagerType).Invoke(null, null);
+            if (viewManager is null) return false;
+
+            var parameters = editDocument.GetParameters();
+            var arguments = new object?[parameters.Length];
+            arguments[0] = document;
+            // FocusInfo is a struct: its default focuses nothing in particular.
+            for (var i = 1; i < parameters.Length; i++)
+            {
+                var type = parameters[i].ParameterType;
+                arguments[i] = type.IsValueType && Nullable.GetUnderlyingType(type) is null ? Activator.CreateInstance(type) : null;
+            }
+            editDocument.Invoke(viewManager, arguments);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: opening {unitId} through the document view manager failed: {Reason(ex)}");
+            return false;
+        }
+    }
+
+    /// <summary>The real failure behind a reflection call, rather than "the target of an invocation threw".</summary>
+    private static string Reason(Exception ex)
+    {
+        while (ex is System.Reflection.TargetInvocationException { InnerException: { } inner }) ex = inner;
+        return $"{ex.GetType().Name}: {ex.Message}";
     }
 
     private const System.Reflection.BindingFlags InstanceFields =
@@ -531,6 +585,18 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         return null;
     }
 
+    /// <summary>
+    /// App-level documents, which belong to no module: App Security (where every project-security
+    /// finding points), Navigation and App Settings. Each name with its storage spelling, and where
+    /// the App Explorer shows it.
+    /// </summary>
+    private static readonly (string Type, string Location)[] ProjectDocuments =
+    {
+        ("Security$ProjectSecurity", "App ▸ Security"),
+        ("Navigation$NavigationDocument", "App ▸ Navigation"),
+        ("Settings$ProjectSettings", "App ▸ Settings"),
+    };
+
     private Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelUnit? FindUntypedUnitObject(IModel app, string unitId)
     {
         var root = untypedModel.GetUntypedModel(app);
@@ -538,6 +604,29 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         {
             var unit = module.GetUnits().FirstOrDefault(u => u.ID.ToString() == unitId);
             if (unit is not null) return unit;
+        }
+        return FindProjectDocument(root, unitId)?.Unit;
+    }
+
+    private static (Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelUnit Unit, string Location)? FindProjectDocument(
+        Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelRoot root, string unitId)
+    {
+        foreach (var (type, location) in ProjectDocuments)
+        {
+            foreach (var candidate in new[] { type, type + "Impl" })
+            {
+                IReadOnlyList<Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelUnit> units;
+                try
+                {
+                    units = root.GetUnitsOfType(candidate);
+                }
+                catch
+                {
+                    continue; // a spelling this Studio Pro version does not know
+                }
+                var unit = units.FirstOrDefault(u => u.ID.ToString() == unitId);
+                if (unit is not null) return (unit, location);
+            }
         }
         return null;
     }
@@ -575,6 +664,7 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         try
         {
             var root = untypedModel.GetUntypedModel(app);
+            if (FindProjectDocument(root, unitId) is { } project) return (null, project.Location);
             foreach (var module in root.GetUnitsOfType("Projects$Module"))
             {
                 var descendants = module.GetUnits().ToList();

@@ -38,7 +38,7 @@ const lockedDownSecurity = {
     requireMixedCase: true,
     requireSymbol: true,
   },
-  userRoles: [{ $Type: 'Security$UserRole', name: 'User', moduleRoles: ['Shop.User'], checkSecurity: true }],
+  userRoles: [{ $Type: 'Security$UserRole', name: 'User', moduleRoles: ['Shop.User'], checkSecurity: true, manageAllRoles: false }],
   demoUsers: [],
 };
 
@@ -236,5 +236,137 @@ describe('references delivered as elements', () => {
     const fired = new Set(r.findings.map((f) => f.ruleId));
     for (const id of ['SEC-003', 'SEC-018', 'SEC-020', 'SEC-029']) assert.ok(fired.has(id), `${id} did not fire`);
     assert.deepEqual(r.diagnostics.guestModuleRoles, ['Shop.Anonymous', 'System.User']);
+  });
+});
+
+describe('no rule passes on a value it could not read', () => {
+  const statusOf = (r, id) => r.rules.find((x) => x.id === id);
+  const withSecurity = (overrides, drop = []) => {
+    const unit = { ...lockedDownSecurity, ...overrides };
+    for (const key of drop) delete unit[key];
+    return analyzeSnapshot(snapshot({ projectUnits: [unit], units: [moduleSecurity] }));
+  };
+
+  test('a fully read project passes the project-level rules on its own values', () => {
+    const r = withSecurity({});
+    for (const id of ['SEC-002', 'SEC-011', 'SEC-012', 'SEC-014', 'SEC-015', 'SEC-016', 'SEC-023', 'SEC-024']) {
+      assert.equal(statusOf(r, id).status, 'PASSED', id);
+    }
+    assert.deepEqual(r.diagnostics.unreadFacts, {});
+  });
+
+  for (const [property, ids] of [
+    ['strictPageUrlCheck', ['SEC-016']],
+    ['checkSecurity', ['SEC-011']],
+    ['enableDemoUsers', ['SEC-012']],
+    ['adminPassword', ['SEC-014']],
+    ['passwordPolicySettings', ['SEC-014', 'SEC-015']],
+    ['enableGuestAccess', ['SEC-006', 'SEC-017']],
+  ]) {
+    test(`an unreadable ${property} makes ${ids.join(', ')} "not verified", not passed`, () => {
+      const r = withSecurity({}, [property]);
+      for (const id of ids) {
+        const rule = statusOf(r, id);
+        assert.equal(rule.status, 'NOT_VERIFIED', id);
+        assert.match(rule.reason, /could not be read/);
+      }
+    });
+  }
+
+  test('an unreadable security level is not reported as CheckNothing', () => {
+    const r = withSecurity({}, ['securityLevel']);
+    assert.equal(statusOf(r, 'SEC-002').status, 'NOT_VERIFIED');
+    assert.equal(r.findings.filter((f) => f.ruleId === 'SEC-002').length, 0);
+  });
+
+  test('a user role without a readable security flag makes SEC-023 not verified', () => {
+    const r = withSecurity({ userRoles: [{ $Type: 'Security$UserRole', name: 'User', moduleRoles: ['Shop.User'] }] });
+    assert.equal(statusOf(r, 'SEC-023').status, 'NOT_VERIFIED');
+    assert.equal(statusOf(r, 'SEC-024').status, 'NOT_VERIFIED');
+  });
+
+  test('a rule that still finds something keeps its findings', () => {
+    const r = withSecurity({ strictPageUrlCheck: false, checkSecurity: undefined });
+    assert.equal(statusOf(r, 'SEC-016').status, 'FAILED');
+  });
+
+  test('not-verified rules are left out of the score, not counted as passes', () => {
+    const full = withSecurity({});
+    const partial = withSecurity({}, ['strictPageUrlCheck']);
+    assert.equal(partial.score.rulesPassed ?? partial.rules.filter((x) => x.status === 'PASSED').length,
+      full.rules.filter((x) => x.status === 'PASSED').length - 1);
+    assert.ok(!partial.findings.some((f) => f.status === 'NOT_APPLICABLE'));
+  });
+
+  test('a microflow without a readable "Apply entity access" makes the microflow rules not verified', () => {
+    const r = analyzeSnapshot(
+      snapshot({
+        projectUnits: [lockedDownSecurity],
+        units: [moduleSecurity, { $Type: 'Microflows$Microflow', name: 'ACT_Save', allowedModuleRoles: ['Shop.User'], objectCollection: { $Type: 'Microflows$MicroflowObjectCollection', objects: [] }, flows: [] }],
+      })
+    );
+    for (const id of ['SEC-028', 'SEC-MF-003']) assert.equal(statusOf(r, id).status, 'NOT_VERIFIED', id);
+    // SEC-MF-001 also needs the reference index, which this snapshot lacks, so the engine skips it.
+    assert.equal(statusOf(r, 'SEC-MF-001').status, 'NOT_APPLICABLE');
+  });
+});
+
+describe('owned data and specializations (SEC-022)', () => {
+  const domainModel = (entities) => ({ $Type: 'DomainModels$DomainModel', $ID: 'dm', entities });
+  const entity = (name, generalization, rules = []) => ({
+    $Type: 'DomainModels$Entity',
+    name,
+    generalization,
+    accessRules: rules,
+    attributes: [],
+  });
+  const userRule = (roles) => ({ $Type: 'DomainModels$AccessRule', moduleRoles: roles, allowCreate: false, allowDelete: false, defaultMemberAccessRights: 'None', memberAccesses: [], xPathConstraint: '' });
+
+  test('a specialization of an owned entity is owned data too', () => {
+    const r = analyzeSnapshot(
+      snapshot({
+        projectUnits: [lockedDownSecurity],
+        units: [
+          moduleSecurity,
+          domainModel([
+            entity('Base', { $Type: 'DomainModels$NoGeneralization', persistable: true, hasOwner: true }),
+            entity('Order', { $Type: 'DomainModels$Generalization', generalization: 'Shop.Base' }, [userRule(['Shop.User'])]),
+          ]),
+        ],
+      })
+    );
+    assert.deepEqual(r.findings.filter((f) => f.ruleId === 'SEC-022').map((f) => f.evidence.artifactPath), ['Shop.Order']);
+  });
+
+  test('a module name containing "admin" does not make its roles administrative', () => {
+    const snap = snapshot({
+      projectUnits: [lockedDownSecurity],
+      units: [
+        moduleSecurity,
+        domainModel([entity('Ticket', { $Type: 'DomainModels$NoGeneralization', persistable: true, hasOwner: true }, [userRule(['AdminPortal.User'])])]),
+      ],
+    });
+    const r = analyzeSnapshot(snap);
+    assert.equal(r.findings.filter((f) => f.ruleId === 'SEC-022').length, 1);
+  });
+});
+
+describe('microflows named by a constant', () => {
+  const run = (withConstant) =>
+    analyzeSnapshot({
+      ...snapshot({
+        projectUnits: [lockedDownSecurity],
+        units: [
+          moduleSecurity,
+          { $Type: 'Microflows$Microflow', name: 'Hook', allowedModuleRoles: ['Shop.User'], applyEntityAccess: true, objectCollection: { $Type: 'Microflows$MicroflowObjectCollection', objects: [] }, flows: [], $References: [] },
+          ...(withConstant ? [{ $Type: 'Constants$Constant', name: 'HookName', defaultValue: 'Shop.Hook', exposedToClient: false }] : []),
+        ],
+      }),
+      referenceIndex: [],
+    });
+
+  test('count as referenced, so SEC-MF-005 does not call them dead', () => {
+    assert.equal(run(false).findings.filter((f) => f.ruleId === 'SEC-MF-005').length, 1);
+    assert.equal(run(true).findings.filter((f) => f.ruleId === 'SEC-MF-005').length, 0);
   });
 });

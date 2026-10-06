@@ -201,11 +201,11 @@ export const microflowSecurityRules = [
     sourceSkill: 'xpath-constraints.md',
     sourceSection: 'Row-Level Security',
     expectedPractice:
-      'A client-callable microflow that changes or deletes an object it received either applies entity access or first checks that the current user may act on that object.',
+      'A client-callable microflow that changes or deletes a stored object it received, or writes values from a received helper object into stored data, either applies entity access or first checks that the current user may act on that data.',
     recommendation:
       'Turn on Apply Entity Access to let the database filter invalid object manipulation, or add a validation gate checking $Parameter/Owner = $CurrentUser.',
     whyItMatters:
-      "The client chooses which object it passes. A microflow running without entity access will change or delete whatever object id it is given, so a user can tamper with the request to act on someone else's record.",
+      "The client chooses which object it passes. A microflow running without entity access will change or delete whatever stored object id it is given, so a user can tamper with the request to act on someone else's record. A non-persistable helper object (a form or wizard entity) is only a risk when its values are written into stored data: on its own it changes nothing in the database.",
     confidence: 'Medium',
     requires: ['microflows', 'microflowActivities'],
     check: (ir, emit) => {
@@ -219,10 +219,26 @@ export const microflowSecurityRules = [
         for (const param of mf.parameters) {
           // Condition 2: an Object or List parameter.
           if (param.type !== 'Object' && param.type !== 'List') continue;
-          // Condition 3: a change or delete on that parameter variable.
-          const index = mf.activities.findIndex(
-            (a) => (a.type === 'ChangeAction' || a.type === 'DeleteAction') && a.properties.variable === param.name
-          );
+          // Condition 3, by what the parameter holds:
+          // - a persistable entity (or one that cannot be established): a change or delete on the
+          //   parameter itself, which acts on the stored record the client picked;
+          // - a non-persistable entity: only when its values are written into persistable data — a
+          //   Change or Create on a persistable entity whose values read from $Parameter. Changing or
+          //   deleting the helper object itself touches nothing in the database.
+          const persistableParam = !param.entity || isPersistableEntity(ir, param.entity);
+          const readsParam = new RegExp(`\\$${param.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_])`);
+          const index = persistableParam
+            ? mf.activities.findIndex(
+                (a) => (a.type === 'ChangeAction' || a.type === 'DeleteAction') && a.properties.variable === param.name
+              )
+            : mf.activities.findIndex(
+                (a) =>
+                  (a.type === 'ChangeAction' || a.type === 'CreateAction') &&
+                  a.properties.variable !== param.name &&
+                  a.targetEntity !== undefined &&
+                  isPersistableEntity(ir, a.targetEntity) &&
+                  readsParam.test(String(a.properties.text ?? ''))
+              );
           if (index < 0) continue;
           // Condition 4: no earlier step validating the current user's authority over it — a
           // database retrieve constrained on [%CurrentUser%], or a decision on $currentUser.
@@ -234,15 +250,18 @@ export const microflowSecurityRules = [
           });
           if (guarded) continue;
 
-          const step = mf.activities[index];
+          const step = mf.activities[index]!;
           const o = ownership(ir, mf, 'High');
+          const received = `$${param.name} (${param.type}${param.entity ? ` of ${param.entity}` : ''}${persistableParam ? '' : ', non-persistable'})`;
           emit({
             key: `${mf.qualifiedName}.${param.name}`,
             module: mf.module,
             status: o.status,
             severity: o.severity,
             artifact: `Microflow: ${mf.qualifiedName}`,
-            observation: `Microflow "${mf.qualifiedName}" does not apply entity access, receives $${param.name} (${param.type}${param.entity ? ` of ${param.entity}` : ''}) from the client, and runs ${step.type} on it without first checking that the current user owns or may act on that object.${o.suffix}`,
+            observation: persistableParam
+              ? `Microflow "${mf.qualifiedName}" does not apply entity access, receives ${received} from the client, and runs ${step.type} on it without first checking that the current user owns or may act on that object.${o.suffix}`
+              : `Microflow "${mf.qualifiedName}" does not apply entity access, receives ${received} from the client, and writes its values into persistable ${step.targetEntity} (${step.type}) without first checking that the current user may change that data.${o.suffix}`,
             objectName: mf.name,
             objectType: 'Microflow',
             artifactPath: mf.qualifiedName,
@@ -251,6 +270,7 @@ export const microflowSecurityRules = [
               parameterType: param.type,
               entity: param.entity ?? null,
               mutation: step.type,
+              ...(persistableParam ? {} : { writesTo: step.targetEntity ?? null }),
               allowedRoles: mf.allowedRoles,
               unitPath: mf.provenance?.unitPath,
             },

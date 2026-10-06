@@ -520,7 +520,7 @@ internal sealed class ModelSnapshotReader
             if (exe is not null)
             {
                 var version = FileVersionInfo.GetVersionInfo(exe).ProductVersion;
-                if (!string.IsNullOrWhiteSpace(version)) return version.Split('+')[0];
+                if (!string.IsNullOrWhiteSpace(version)) return version.Split('+')[0].Trim();
             }
         }
         catch

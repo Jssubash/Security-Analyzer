@@ -929,7 +929,9 @@ const coreSecurityRules = [
         if (entity.hasOwnerAttribute !== true) continue;
         if (!isUserModule(ir, entity.module)) continue;
         if (rule.xPathConstraint) continue;
-        if (rule.moduleRoles.every((r) => isAdministratorRole(r))) continue;
+        // Judge the role's own name, not `Module.Role`: a module called Administration or
+        // AdminPortal would otherwise make every role in it look administrative.
+        if (rule.moduleRoles.every((r) => isAdministratorRole(r.slice(r.lastIndexOf('.') + 1)))) continue;
 
         emit({
           key: `${entity.qualifiedName}#${ordinal}`,

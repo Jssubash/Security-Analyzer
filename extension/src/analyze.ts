@@ -18,12 +18,18 @@ import type { JavaLibraryReport } from './java-libraries.js';
 import { buildUpgradeInventory } from './marketplace.js';
 import type { UpgradeInventory } from './marketplace.js';
 import { buildModuleStatus } from './module-status.js';
+import { RULE_CHECKS } from './rule-checks.js';
+import type { RuleCheck } from './rule-checks.js';
 import type { ModuleStatus } from './module-status.js';
 import { buildIrFromSnapshot } from './snapshot/build-ir.js';
-import type { ReadDiagnostics, UnitLocator } from './snapshot/build-ir.js';
+import type { ReadDiagnostics, UnitLocator, UnreadFact } from './snapshot/build-ir.js';
 import type { ModelSnapshot } from './snapshot/types.js';
 
-export type RuleOutcomeStatus = 'PASSED' | 'FAILED' | 'WARNING' | 'NOT_APPLICABLE' | 'DISABLED';
+/**
+ * `NOT_VERIFIED`: the rule ran, found nothing, but a value it depends on could not be read from
+ * the open app — so "nothing found" is not a pass. Excluded from the score like NOT_APPLICABLE.
+ */
+export type RuleOutcomeStatus = 'PASSED' | 'FAILED' | 'WARNING' | 'NOT_APPLICABLE' | 'NOT_VERIFIED' | 'DISABLED';
 
 export interface RuleOutcome {
   id: string;
@@ -33,8 +39,12 @@ export interface RuleOutcome {
   severity: RuleSeverity;
   status: RuleOutcomeStatus;
   findingCount: number;
-  /** Why the rule did not run, for NOT_APPLICABLE and DISABLED. */
+  /** Why the rule did not run or could not conclude, for NOT_APPLICABLE, NOT_VERIFIED and DISABLED. */
   reason?: string;
+  /** What the rule validates, shown when its row is expanded. */
+  checks?: RuleCheck;
+  whyItMatters: string;
+  recommendation: string;
 }
 
 export interface AnalysisOptions {
@@ -85,8 +95,101 @@ const SEVERITY_ORDER: Record<RuleSeverity, number> = {
   Informational: 4,
 };
 
+/**
+ * Rules of the shared catalogue that the extension does not run.
+ *
+ * SEC-007 (regex-based XSS sanitiser in a Java action) is pattern matching on Java source: it
+ * cannot tell a sanitiser from any other regular expression, and in practice it flagged the
+ * Marketplace FeedbackModule's own action, which the team cannot change. Removed at the team's
+ * request; the web dashboard keeps it.
+ */
+export const EXCLUDED_RULES = new Set(['SEC-007']);
+
+/**
+ * The individual values each rule reads, beyond the fact groups it declares in `requires`.
+ *
+ * The engine skips a rule only when a whole group is unreadable. Inside a readable group a single
+ * value can still be missing — a flag Studio Pro did not expose, a role list that came back empty —
+ * and a rule that then finds nothing has not checked anything. Every rule that passes is meant to
+ * have looked at this app's own model; this map is what enforces it.
+ */
+export const RULE_INPUTS: Record<string, readonly UnreadFact[]> = {
+  'SEC-002': ['securityLevel'],
+  'SEC-011': ['checkSecurity'],
+  'SEC-012': ['enableDemoUsers'],
+  'SEC-013': ['demoUserPasswords'],
+  'SEC-014': ['adminPassword', 'passwordPolicy'],
+  'SEC-015': ['passwordPolicy'],
+  'SEC-016': ['strictPageUrlCheck'],
+  'SEC-006': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles'],
+  'SEC-017': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles'],
+  'SEC-018': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles'],
+  'SEC-009': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles'],
+  'SEC-003': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles', 'accessRuleRoles'],
+  'SEC-020': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles', 'accessRuleRoles'],
+  'SEC-029': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles', 'accessRuleRoles'],
+  'SEC-021': ['userRoleModuleRoles', 'accessRuleRoles'],
+  'SEC-022': ['entityOwner', 'accessRuleRoles'],
+  'SEC-EE-003': ['accessRuleRoles'],
+  'SEC-005': ['attributeTypes'],
+  'SEC-008': ['attributeTypes'],
+  'SEC-023': ['userRoleCheckSecurity'],
+  'SEC-024': ['userRoleManageAllRoles'],
+  'SEC-025': ['userRoleModuleRoles'],
+  'SEC-028': ['applyEntityAccess', 'enableGuestAccess', 'guestUserRole'],
+  'SEC-MF-001': ['applyEntityAccess'],
+  'SEC-MF-002': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles'],
+  'SEC-MF-003': ['applyEntityAccess'],
+};
+
+/** Why a rule that found nothing has not verified anything, or `undefined` when it has. */
+export function unverifiedReason(ruleId: string, diagnostics: ReadDiagnostics): string | undefined {
+  const missing = (RULE_INPUTS[ruleId] ?? [])
+    .map((fact) => diagnostics.unreadFacts[fact])
+    .filter((d): d is string => d !== undefined);
+  if (missing.length === 0) return undefined;
+  return `not verified: ${missing.join('; ')} could not be read from the open app, so finding nothing here is not a pass`;
+}
+
+/**
+ * Wrap a rule so that, when it finds nothing while one of its inputs was unreadable, it reports a
+ * NOT_APPLICABLE finding instead. The engine then leaves it out of the score rather than counting
+ * a pass. SEC-002 is the one rule whose IR value is defaulted when unread (the level becomes
+ * CheckNothing), so its findings are dropped too: they would describe a level nobody read.
+ */
+function guarded(rule: Rule, diagnostics: ReadDiagnostics): Rule {
+  const reason = unverifiedReason(rule.id, diagnostics);
+  if (!reason) return rule;
+  return {
+    ...rule,
+    evaluate: (ir) => {
+      const findings = rule.id === 'SEC-002' ? [] : rule.evaluate(ir);
+      if (findings.some((f) => f.status === 'FAIL' || f.status === 'WARNING')) return findings;
+      return [
+        {
+          id: `${rule.id}-not-verified`,
+          ruleId: rule.id,
+          ruleTitle: rule.name,
+          category: rule.category,
+          severity: rule.severity,
+          status: 'NOT_APPLICABLE',
+          artifact: 'Model read',
+          observation: reason,
+          whyItMatters: rule.whyItMatters,
+          expectedPractice: rule.expectedPractice,
+          recommendation: 'Re-run the analysis; if this persists, send the diagnostic snapshot so the read can be fixed.',
+          confidence: 'High',
+          evidence: { artifactPath: '', objectName: rule.id, objectType: 'Rule', details: { unverified: true } },
+          sourceSkill: rule.sourceSkill,
+          sourceSection: rule.sourceSection,
+        },
+      ];
+    },
+  };
+}
+
 export function securityCatalogue(options: AnalysisOptions = {}): Rule[] {
-  return securityRules.map((rule) => {
+  return securityRules.filter((rule) => !EXCLUDED_RULES.has(rule.id)).map((rule) => {
     const override = options.enabledRules?.[rule.id];
     return override === undefined ? rule : { ...rule, enabled: override };
   });
@@ -102,7 +205,7 @@ export function analyzeSnapshot(
 
   const catalogue = securityCatalogue(options);
   const registry = new RuleRegistry();
-  registry.registerMany(catalogue);
+  registry.registerMany(catalogue.map((rule) => guarded(rule, diagnostics)));
   const summary = new RuleEngine(registry).evaluate(ir);
   const score = new ScoringEngine().calculateScores(summary, ir.coverage);
 
@@ -117,6 +220,9 @@ export function analyzeSnapshot(
     );
 
   const skipped = new Map(summary.skippedRules.map((s) => [s.ruleId, s.reason]));
+  const unverified = new Map(
+    summary.findings.filter((f) => f.status === 'NOT_APPLICABLE' && f.evidence.details['unverified'] === true).map((f) => [f.ruleId, f.observation])
+  );
   const rules: RuleOutcome[] = catalogue.map((rule) => {
     const own = findings.filter((f) => f.ruleId === rule.id);
     let status: RuleOutcomeStatus;
@@ -126,7 +232,13 @@ export function analyzeSnapshot(
       reason = 'advisory rule, off by default';
     } else if (skipped.has(rule.id)) {
       status = 'NOT_APPLICABLE';
-      reason = skipped.get(rule.id);
+      reason =
+        rule.requires.includes('publishedServices') && diagnostics.publishedRestServices === 0
+          ? 'nothing to check: the app publishes no REST services'
+          : skipped.get(rule.id);
+    } else if (unverified.has(rule.id)) {
+      status = 'NOT_VERIFIED';
+      reason = unverified.get(rule.id);
     } else if (own.some((f) => f.status === 'FAIL')) {
       status = 'FAILED';
     } else if (own.length > 0) {
@@ -143,6 +255,9 @@ export function analyzeSnapshot(
       status,
       findingCount: own.length,
       reason,
+      checks: RULE_CHECKS[rule.id],
+      whyItMatters: rule.whyItMatters,
+      recommendation: rule.recommendation,
     };
   });
 

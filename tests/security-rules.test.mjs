@@ -918,6 +918,42 @@ const CASES = [
             ]),
           }),
       ],
+      [
+        'a non-persistable parameter that is only changed or deleted itself',
+        () =>
+          makeIr({
+            entities: byQualifiedName([entity('App.PasswordData', { persistenceType: 'non-persistable' })]),
+            microflows: byQualifiedName([
+              microflow('App.MB_ChangePasswordSave', {
+                appliesEntityAccess: false,
+                allowedRoles: ['App.User'],
+                parameters: [{ name: 'PasswordData', type: 'Object', entity: 'App.PasswordData' }],
+                activities: [
+                  mfStep('ChangeAction', { targetEntity: 'App.PasswordData', properties: { variable: 'PasswordData', text: 'PasswordData NewPassword ""' } }),
+                  mfStep('DeleteAction', { targetEntity: 'App.PasswordData', properties: { variable: 'PasswordData' } }),
+                ],
+              }),
+            ]),
+          }),
+      ],
+      [
+        "a non-persistable parameter whose values only go into another non-persistable object",
+        () =>
+          makeIr({
+            entities: byQualifiedName([
+              entity('App.PasswordData', { persistenceType: 'non-persistable' }),
+              entity('App.Feedback', { persistenceType: 'non-persistable' }),
+            ]),
+            microflows: byQualifiedName([
+              microflow('App.MB_Preview', {
+                appliesEntityAccess: false,
+                allowedRoles: ['App.User'],
+                parameters: [{ name: 'PasswordData', type: 'Object', entity: 'App.PasswordData' }],
+                activities: [mfStep('CreateAction', { targetEntity: 'App.Feedback', properties: { outputVariable: 'Feedback', text: 'App.Feedback Message $PasswordData/NewPassword' } })],
+              }),
+            ]),
+          }),
+      ],
     ],
   },
   {
@@ -1141,5 +1177,52 @@ describe('SEC-018: anonymous pages are judged by the data they use', () => {
   it('judges a navigation home page by its data too, once its contents are known', () => {
     const order = entity('App.Order', { accessRules: [accessRule(['App.Anonymous'], { defaultMemberAccess: 'ReadOnly' })] });
     assert.equal(run([order], [anonPage(['App.Order'], { isNavigationHomePage: true })]).length, 1);
+  });
+});
+
+describe('SEC-MF-003: a non-persistable parameter counts only when its values reach stored data', () => {
+  const build = (steps) =>
+    makeIr({
+      entities: byQualifiedName([
+        entity('App.PasswordData', { persistenceType: 'non-persistable' }),
+        entity('App.Account', { persistenceType: 'persistable' }),
+      ]),
+      microflows: byQualifiedName([
+        microflow('App.MB_ChangePasswordSave', {
+          appliesEntityAccess: false,
+          allowedRoles: ['App.User'],
+          parameters: [
+            { name: 'PasswordData', type: 'Object', entity: 'App.PasswordData' },
+            { name: 'Account', type: 'Object', entity: 'App.Account' },
+          ],
+          activities: steps,
+        }),
+      ]),
+    });
+  const findings = (steps) => evaluate('SEC-MF-003', build(steps)).filter((f) => f.evidence.details.parameter === 'PasswordData');
+
+  it('fires when a Change on a persistable object takes a value from it', () => {
+    const [f] = findings([mfStep('ChangeAction', { targetEntity: 'App.Account', properties: { variable: 'Account', text: 'Account Password $PasswordData/NewPassword' } })]);
+    assert.ok(f, 'expected a finding');
+    assert.equal(f.evidence.details.writesTo, 'App.Account');
+    assert.match(f.observation, /\$PasswordData \(Object of App.PasswordData, non-persistable\).*writes its values into persistable App.Account \(ChangeAction\)/);
+  });
+
+  it('fires when a persistable object is created from its values', () => {
+    assert.equal(findings([mfStep('CreateAction', { targetEntity: 'App.Account', properties: { outputVariable: 'New', text: 'App.Account Name $PasswordData/Username' } })]).length, 1);
+  });
+
+  it('does not mistake a longer variable name for it', () => {
+    assert.equal(findings([mfStep('ChangeAction', { targetEntity: 'App.Account', properties: { variable: 'Account', text: 'Account Password $PasswordDataCopy/NewPassword' } })]).length, 0);
+  });
+
+  it('stays quiet when an ownership check comes first', () => {
+    assert.equal(
+      findings([
+        mfStep('Decision', { properties: { expression: '$Account/System.owner = $currentUser' } }),
+        mfStep('ChangeAction', { targetEntity: 'App.Account', properties: { variable: 'Account', text: 'Account Password $PasswordData/NewPassword' } }),
+      ]).length,
+      0
+    );
   });
 });
