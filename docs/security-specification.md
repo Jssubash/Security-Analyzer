@@ -169,7 +169,7 @@ Specific intake defects:
   combination.
 - **Findings are persisted with full IR** to `data/runs/*.json` world-readable, including any secret
   values the analyzer extracts (see `SEC-041`). Retention and redaction are unspecified.
-- **A hardcoded local path** to `c:\Users\<user>\Downloads\SampleNativeApplication.zip` is a fallback in
+- **A hardcoded local path** to a sample project archive in a developer's Downloads folder is a fallback in
   `app.controller.ts:129-131`. Unknown application IDs silently analyse a developer's local file.
 
 ### 2.5 What is genuinely working and should be preserved
@@ -183,7 +183,7 @@ Specific intake defects:
 - The BSON property decoder, though flat, does read real values correctly — `SecurityLevel`,
   `GuestUserRole` and user-role→module-role mappings in the run output match the fixture exactly.
   The decoder needs to be *completed*, not replaced wholesale.
-- `SEC-006`, `SEC-007` and `SEC-010` operate on real (if narrowly parsed) data.
+- `SEC-006` and `SEC-010` operate on real (if narrowly parsed) data.
 
 ---
 
@@ -417,9 +417,8 @@ and stored runs key on it.
 | `SEC-003` | Guest-reachable role has create/delete on an entity | Critical | High | Existing, re-grounded: any `accessRule.moduleRoles ∩ guestModuleRoles` with `allowCreate \|\| allowDelete \|\| defaultMemberAccess === 'ReadWrite'`. |
 | `SEC-020` | Guest-reachable role has write access to a member | High | High | `memberAccess[].access === 'ReadWrite'` on a rule granted to a guest-mapped module role. |
 | `SEC-029` | Anonymous role has access to a persistable entity | High | High | Any access rule on a persistable, non-platform entity granted to a guest-mapped module role, whatever its rights. Added after Phase 1; see §6.9. |
-| `SEC-021` | Sensitive or PII member readable by a broad role | High | Medium | Member matches the sensitive/PII classifier (§6.6) and is `ReadOnly`/`ReadWrite` for a role mapped to more than one user role. |
 | `SEC-022` | Owned-data entity without an XPath constraint | Medium | Low | `systemMembers.hasOwner === true` (or an association to `System.User`) and a non-admin access rule has no `xPathConstraint`. Heuristic: §22 forbids asserting a constraint is required without evidence, so this ships as `WARNING` with Low confidence and a plain statement of the assumption. |
-| `SEC-005` | Password/secret attribute not hashed | High | High | Existing, re-grounded on the **real** attribute type: classifier-sensitive name with type `String` rather than `HashedString`. Confidence rises from Medium to High because the type is now read, not guessed. |
+| `SEC-005` | Password/secret attribute stored as plain text | High | High | Existing, re-grounded on the **real** attribute type: classifier-sensitive name with type `String` rather than `HashedString`, on a **persistable** entity only (following the generalization chain): a non-persistable entity is never written to the database. Confidence rises from Medium to High because the type is now read, not guessed. The advice depends on the use: a value the app only verifies (password, PIN) is hashed; a value it must read back (token, API key, secret) is encrypted before commit with the Encryption module's EncryptString / DecryptString. **Writes followed (1.0.30):** every Create/Change object member setting the attribute is classified — encrypted when the value is `$Var` holding — directly, through a sub-microflow's return value, or through Create/Change variable copies — the result of a Java action whose own code (or a helper class of its module it names) uses Java's `Cipher` in `ENCRYPT_MODE`; a plain write replaced by an encrypted one on the same object before any commit (activity Commit setting or Commit activity) does not count. All writes encrypted and no page referring to the attribute → passed; all encrypted but a page refers to it or a plain value is typed into the model → Review (Medium); otherwise Failed (High). |
 | `SEC-008` | PII stored unencrypted | Medium | Low | Existing, **downgraded from High/High.** "String-typed PII" is not a violation on its own — Mendix has no native encrypted attribute type and encryption is normally applied in logic. Ships as `WARNING`, policy-gated (`enabled: false` by default), Low confidence. Firing it four times on TestApp as a High finding is exactly the false-positive inflation §22 warns about. |
 
 *Source skill: `manage-security.md`, `xpath-constraints.md`, `mdl-entities.md`, `system-module.md`.*
@@ -434,11 +433,10 @@ and stored runs key on it.
 
 *Source skill: `manage-security.md`.*
 
-### 6.5 Custom code, constants & integration
+### 6.5 Constants & integration
 
 | ID | Rule | Sev | Conf | Detection |
 |---|---|---|---|---|
-| `SEC-007` | Regex-based XSS sanitiser | High | High | Existing. Scope-limit to `javasource/<user module>/actions/**` — a marketplace module's internals are not a customer design violation. |
 | `SEC-026` | Hardcoded secret in a constant | High | Medium | `Constants$Constant` whose `Name` or `DefaultValue` matches the secret classifier and has a non-empty `DefaultValue`. Evidence records name + `ExposedToClient`, **not the value**. |
 | `SEC-027` | Secret-bearing constant exposed to the client | Critical | High | `SEC-026` conditions **and** `ExposedToClient === true`. Client-exposed constants are readable by any browser session. |
 | `SEC-004` | Published REST endpoint without authentication | Critical | High | Existing logic is correct; it has no input. Phase 1 declares `requires: ['publishedServices']` so absence of `Rest$*` units yields `NOT_APPLICABLE`, not a pass. Endpoint parsing lands when a fixture with published services exists. |
@@ -449,7 +447,7 @@ and stored runs key on it.
 
 ### 6.6 Sensitive / PII classifier
 
-`SEC-005`, `SEC-008`, `SEC-021`, `SEC-026` and `SEC-027` all depend on name classification, which is
+`SEC-005`, `SEC-008`, `SEC-026` and `SEC-027` all depend on name classification, which is
 currently duplicated as inline regexes in two files. Phase 1 extracts one module,
 `packages/rules/src/classifiers/sensitivity.ts`, returning
 `{ kind: 'secret' | 'pii' | 'none', matchedTerm, confidence }`.
@@ -472,6 +470,7 @@ corroborates it (e.g. `SEC-005` also reads the real attribute type ⇒ High).
 | New `SEC-*` | 18 |
 | **Phase 1 catalogue total** | **28** |
 | Added after Phase 1 (§6.9) | 1 (`SEC-029`) |
+| Removed later (§6.13) | 2 (`SEC-007`, `SEC-021`) |
 | Of which `NOT_ANALYZABLE` in Phase 1 by design | 1 (`SEC-004`) |
 | Of which policy-gated off by default | 2 (`SEC-008`, `SEC-009`) |
 
@@ -490,7 +489,7 @@ to be unreadable in Phase 1. `ApplyEntityAccess` and the allowed module roles ar
 scalars on the flow unit, so the rule runs. Only `SEC-004` is skipped by design, because it requires
 `publishedServices`.
 
-**Marketplace ownership splits severity, not just noise filtering.** `SEC-006`, `SEC-007` and
+**Marketplace ownership splits severity, not just noise filtering.** `SEC-006` and
 `SEC-028` each report a user module as `FAIL`/Critical-to-High and a marketplace module as
 `WARNING` at one severity lower, with wording that says the source cannot be edited in place. The
 reference project's three `SEC-006` hits were all Critical before this: one real
@@ -505,10 +504,6 @@ first version of the platform check reported `System.User` as coming from "marke
 System". `isPlatformModule` in `packages/rules/src/security-facts.ts` treats an unknown module name
 as platform for exactly this reason. `System.User` is granted to every user role by Mendix itself:
 reporting it would fire on every project and could not be acted on if it did.
-
-**`SEC-021` stays at High even when a guest role is involved.** Escalating to Critical made it
-compound with `SEC-020` on the same member at the top weight — one member, two Critical findings.
-Guest involvement is stated in the observation instead.
 
 **`SEC-003` and `SEC-020` are restricted to persistable entities.** Create and write rights on a
 non-persistable entity expose no stored data, and marketplace login forms are full of them.
@@ -576,16 +571,19 @@ analyzer skips the rules rather than passing them.
 
 | ID | Rule | Sev | Detection as implemented |
 |---|---|---|---|
-| `SEC-MF-001` | Missing entity access on client interactions | Critical | Apply entity access off; an allowed role that is neither System nor named as an administrator; referenced by a page, snippet, layout or navigation document. |
+| `SEC-MF-001` | Microflow started from a page runs without entity access | Critical | Apply entity access off; an allowed role that is neither System nor named as an administrator; referenced by a page, snippet, layout or navigation document. |
 | `SEC-MF-002` | Anonymous user write permissions | Critical | Allowed for a module role the Anonymous-tab user role holds; a create, change or delete whose entity resolves (through the variable) to a persistable entity. An unresolvable entity does not fire. |
-| `SEC-MF-003` | Parameter ID tampering | High | Entity access off; client-callable (allowed roles set); an Object/List parameter changed or deleted with no earlier database retrieve constrained on `[%CurrentUser%]` and no earlier decision on `$currentUser`. |
+| `SEC-MF-003` | Microflow trusts the object the browser sends (ID tampering) | High | Entity access off; client-callable (allowed roles set); an Object/List parameter changed or deleted with no earlier database retrieve constrained on `[%CurrentUser%]` and no earlier decision on `$currentUser`. |
 | `SEC-MF-004` | Public endpoint missing auth logic | High | Published REST operation without authentication whose first two steps show no HttpRequest/HttpHeader use and no Java action named for auth, token, JWT or API-key checks. OData is not extracted yet. |
 | `SEC-MF-005` | Dead/exposed privilege code | Medium | Allowed roles set, user module, and no reference from any unit (pages, layouts, navigation, flows, entity events, scheduled events, workflows, services, project settings) or from Java source. |
+| `SEC-MF-006` | Integration call without error handling and logging | High | An activity that calls another system or converts external data (Call REST service, Send REST request, Call web service, OData external action/object, Import/Export with mapping, Generate document, Call ML model, Call workflow, Java action — recognised by activity type, never by caption) keeps the default "Rollback" error handling (High), or has custom error handling whose error flow reaches no Log message activity, directly or through a called microflow (Medium). One finding per microflow. Java actions: every call in your own modules; in Marketplace modules only in microflows that run in the background (started by a scheduled event or workflow, called in a task queue, or called from such a microflow). Disabled activities and activities set to "Continue" (a deliberate choice to carry on) are skipped. Source: Mendix *Error Handling in Microflows* and *Call REST Service* ("always add an error handler"). |
+| `SEC-MF-007` | Value converted without an empty check | Medium | Data Integrity. A Create/Change object member expression reads `$Object/Member` (any object variable, also through associations) inside a conversion or function (parseInteger/Long/Decimal/DateTime[UTC] without a default value, toString, format*, getCaption, getKey, dateTimeToEpoch, epochToDateTime, round, floor, ceil, abs, pow, sqrt, max, min, add*/subtract*/between*/beginOf*/endOf*/trimTo*) or a calculation (* : div mod -, + on a numeric attribute), with no empty check: not in the expression (`!= empty` / `= empty` on the same path) and not in an earlier Decision. The innermost function reading the value is named. High when the microflow runs in the background. Sources: Mendix *Parse and Format Decimal/Date*, *Parse Integer*, *To String*, *Expressions*. |
+| `SEC-MF-008` | Role can run the microflow but lacks the entity access its activities need | Critical | "Apply entity access" on. For every allowed module role, judged by its own access rules in its own module (another role of the same module that a user role also holds does not count); for entities in another module, the roles of that module every user role holding it also holds. Sub-microflows are checked with the callers' module roles (task-queue calls not followed): Create needs allowCreate and write on each member set; Change needs write on each member set; Delete needs allowDelete; Retrieve from database needs an access rule (Medium, returns nothing). Rules on generalizations count. Only the rules' access rights count ("Create objects", "Delete objects", Read/Write per member), whether or not a rule has an XPath constraint (user decision 2026-10-13). Non-persistable entities skipped (runtime does not enforce; Administration module relies on it). Associations no rule mentions are skipped. Source: Mendix *Access Rules*, *Microflow Properties* (Apply entity access). |
 
 Activity types are normalised across spellings (`CreateChangeAction`/`CreateObjectAction` →
 `CreateAction`, `ChangeAction`/`ChangeObjectAction` → `ChangeAction`). A Marketplace microflow is
-reported as `WARNING` one severity lower, as elsewhere in the catalogue. SEC-MF-001 overlaps SEC-028,
-which reports any role-callable microflow without entity access; SEC-MF-001 is the UI-triggered case.
+reported as `WARNING` one severity lower, as elsewhere in the catalogue. SEC-MF-001 is the UI-triggered
+case of SEC-028; since §6.14 SEC-028 leaves those microflows to it, so each is reported once.
 
 ### 6.12 SEC-EE-003 — broad default member rights
 
@@ -598,6 +596,38 @@ rule for read-and-write access, "this forces you to think about each attribute t
 entity". A Read default is flagged by this governance standard for the same reason; the finding says
 which of the two applies. Runs in both the archive parser and the Studio Pro extension, because it
 needs only the access rule's default and roles. TestApp gains four Marketplace findings.
+
+### 6.13 Removed rules — SEC-007 and SEC-021
+
+Both were deleted from the catalogue (2026-10-12), with their tests and the code only they used; they
+no longer run in the archive analyzer or the Studio Pro extension, and the catalogue is 33 rules.
+
+- **`SEC-007` Regex-based XSS sanitiser.** Removed at the team's request: pattern matching on Java
+  source cannot tell an HTML sanitiser from any other regular expression, and it flagged a Marketplace
+  module's own action, which the team cannot change. Removed with the `hasRegexXssSanitizer` fact and
+  its detector.
+- **`SEC-021` Sensitive or PII member readable by a broad role.** Removed at the team's request. On
+  real apps it reported large numbers of findings, mostly on members of Marketplace modules that are
+  read through those modules' own user roles. Removed with the
+  `broadModuleRoles` helper. Anonymous access to members is still covered by `SEC-020` and `SEC-029`,
+  and plain-text secrets by `SEC-005`.
+
+### 6.14 Microflow entity access — reported once, graded by data access
+
+`SEC-028`, `SEC-MF-001` and `SEC-MF-003` all start from a microflow running with "Apply entity
+access" off, each narrower than the one before: callable by a role; started from a page; changing
+the object the browser sent. Two changes keep that from reading as three findings for one problem:
+
+- **Reported once.** `SEC-028` leaves to `SEC-MF-001` every microflow a page, snippet, layout or
+  navigation item starts for a non-administrator role (`isUserFacingWithoutEntityAccess`). Without
+  where-used facts (the archive parser) `SEC-028` reports as before.
+- **Graded by what the microflow itself does** (`dataAccess`): writes stored data, only reads it,
+  calls other microflows, or touches none. `SEC-MF-001`: Critical / High / Medium (Review) / Low
+  (Review). `SEC-028`: High / Medium / Low (Review) / Low (Review). One level higher when the
+  anonymous role can call it; Marketplace one lower and Review, as elsewhere. Without microflow
+  contents the previous grading is kept.
+
+`SEC-MF-003` is unchanged in logic and stays High: it is a concrete exploit path (a tampered object id).
 
 ## 7. Intake hardening
 
@@ -629,7 +659,7 @@ Closing §2.4 against design §16.
    magic bytes `PK\x03\x04` plus a `.zip`/`.mpk` extension before accepting.
 8. Replace `origin: '*', credentials: true` with an allow-list from `CORS_ORIGINS`, defaulting to
    `http://localhost:5173`.
-9. Delete the hardcoded `c:\Users\<user>\Downloads\...` fallback in `app.controller.ts:128-141`; an
+9. Delete the hardcoded local-path fallback in `app.controller.ts:128-141`; an
    unknown application ID returns 404.
 10. Redact classified secrets before `StorageService.saveRun` and before report generation. Add a
     documented retention policy for `data/runs` and `data/uploads` with a configurable TTL.
@@ -716,7 +746,6 @@ Phase 1 is done when, with the verifying test named against each:
    and its `sourceSkill` names a file that exists in `skills/`. — §8.4. `artifactPath` is the
    logical path (`MyFirstModule.RequestForm.Email`); the `.mxunit` path is asserted through
    `Evidence.details.unitPath`, which is checked to exist on disk wherever a finding carries one.
-   `SEC-007` is anchored to a `.java` file rather than a unit, by nature.
 7. ✅ TestApp's `SEC-014`, `SEC-017`, `SEC-012`, `SEC-013` and `SEC-015` findings are produced —
    five real security defects the analyzer missed. — §8.4, asserted individually.
 8. ✅ No secret value appears in the IR, any persisted run, or any generated report. — §8.7

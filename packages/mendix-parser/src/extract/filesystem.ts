@@ -76,7 +76,6 @@ function readJavaActions(
         module: resolveModule(dirName),
         sourceFile,
         usesExternalLibraries: source ? importedPackages(source) : [],
-        hasRegexXssSanitizer: source ? usesRegexXssSanitizer(source) : undefined,
       });
     }
   }
@@ -123,17 +122,6 @@ function readPackages(dir: string, extension: string): { name: string; sizeBytes
     }
   }
   return packages;
-}
-
-/**
- * Detect hand-rolled regex XSS filtering.
- *
- * A regex is the wrong tool for stripping script from HTML, so its presence is the finding.
- * The check is deliberately narrow — a sanitiser that calls a library is not flagged.
- */
-function usesRegexXssSanitizer(source: string): boolean {
-  if (!/replaceAll\s*\(|replaceFirst\s*\(|Pattern\.compile/.test(source)) return false;
-  return /<\s*script|javascript:|onerror\s*=|xss/i.test(source);
 }
 
 /** Non-JDK, non-Mendix imports, as a rough dependency signal for the Security category. */

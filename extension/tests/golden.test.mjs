@@ -31,7 +31,6 @@ const EXPECTED = [
   'SEC-EE-003-NanoflowCommons.Position#1 | WARNING | Medium',
   'SEC-006-Atlas_Web_Content.User | WARNING | Medium',
   'SEC-006-MyFirstModule.User | FAIL | Critical',
-  'SEC-007-FeedbackModule.XSS_Sanitizer | WARNING | Medium',
   'SEC-012-enabled | FAIL | High',
   'SEC-013-demo_administrator | FAIL | High',
   'SEC-013-demo_user | FAIL | High',
@@ -42,18 +41,20 @@ const EXPECTED = [
   'SEC-020-MyFirstModule.RequestForm.Email#1 | FAIL | High',
   'SEC-020-MyFirstModule.RequestForm.Name#1 | FAIL | High',
   'SEC-020-MyFirstModule.RequestForm.PhoneNumber#1 | FAIL | High',
-  'SEC-021-MyFirstModule.RequestForm.Email#1 | FAIL | High',
-  'SEC-021-MyFirstModule.RequestForm.PhoneNumber#1 | FAIL | High',
-  'SEC-028-Atlas_Core.DS_Account_CurrentUser | WARNING | High',
+  // SEC-028 leaves DS_Account_CurrentUser to SEC-MF-001: a page starts it, so it is reported once.
   'SEC-029-MyFirstModule.RequestForm#1 | FAIL | High',
   // SEC-MF rules read microflow bodies and the reference index, which only the extension extracts.
-  'SEC-MF-001-Administration.ShowMyPasswordForm | WARNING | High',
+  // Graded by data access: it only opens a page and touches no stored data (Low, Marketplace).
+  'SEC-MF-001-Administration.ShowMyPasswordForm | WARNING | Low',
   'SEC-MF-001-Atlas_Core.DS_Account_CurrentUser | WARNING | High',
-  'SEC-MF-003-FeedbackModule.SUB_Feedback_SendToServer.Feedback | WARNING | Medium',
+  // SEC-MF-003 is quiet: SUB_Feedback_SendToServer only changes its non-persistable Feedback
+  // parameter itself and writes none of its values into stored data.
 ];
 
 /** Rules the parser path skips (it does not read microflow bodies or the reference index). */
-const EXTENSION_ONLY = /^SEC-MF-/;
+// SEC-028 also reads where-used and microflow contents (to leave SEC-MF-001's microflows to it, and
+// to grade by data access), which the archive parser does not extract.
+const EXTENSION_ONLY = /^(SEC-MF-|SEC-028$)/;
 
 const line = (f) => `${f.id} | ${f.status} | ${f.severity}`;
 
@@ -63,13 +64,13 @@ function run() {
   return cached;
 }
 
-async function parserPath() {
+async function parserPath(enabledRules) {
   const { parseExtractedProject } = await import('@mendix-analyzer/mendix-parser');
   const { RuleEngine, RuleRegistry } = await import('@mendix-analyzer/rule-engine');
   const { ScoringEngine } = await import('@mendix-analyzer/scoring');
   const ir = parseExtractedProject(FIXTURE_ROOT, FIXTURE_MPR);
   const registry = new RuleRegistry();
-  registry.registerMany(securityCatalogue());
+  registry.registerMany(securityCatalogue({ enabledRules }));
   const summary = new RuleEngine(registry).evaluate(ir);
   return { summary, score: new ScoringEngine().calculateScores(summary, ir.coverage) };
 }
@@ -82,7 +83,7 @@ describeFixture('Security Analyzer extension on the reference project', () => {
   test('agrees finding-for-finding with the parser path', async () => {
     const { summary } = await parserPath();
     const oracle = summary.findings
-      .filter((f) => f.status === 'FAIL' || f.status === 'WARNING')
+      .filter((f) => (f.status === 'FAIL' || f.status === 'WARNING') && !EXTENSION_ONLY.test(f.ruleId))
       .map((f) => `${line(f)} | ${f.observation}`)
       .sort();
     // Compared on the rules both paths can run; the SEC-MF rules are locked above instead.
@@ -94,8 +95,8 @@ describeFixture('Security Analyzer extension on the reference project', () => {
   });
 
   test('produces the same Security score as the parser path, on the rules both can run', async () => {
-    const { score } = await parserPath();
     const disabled = Object.fromEntries(securityCatalogue().filter((r) => EXTENSION_ONLY.test(r.id)).map((r) => [r.id, false]));
+    const { score } = await parserPath(disabled);
     const result = analyzeSnapshot(snapshotFromMprContents(FIXTURE_ROOT, FIXTURE_MPR), { enabledRules: disabled });
     assert.equal(typeof result.securityScore, 'number');
     assert.equal(result.securityScore, score.categoryScores['Security']);
@@ -118,7 +119,7 @@ describeFixture('Security Analyzer extension on the reference project', () => {
   test('skips SEC-004 because the app publishes no REST service, and says why', () => {
     const sec004 = run().rules.find((r) => r.id === 'SEC-004');
     assert.equal(sec004.status, 'NOT_APPLICABLE');
-    assert.match(sec004.reason, /publishedServices/);
+    assert.match(sec004.reason, /publishes no REST services/);
   });
 
   test('keeps the advisory rules switched off by default', () => {
@@ -129,9 +130,10 @@ describeFixture('Security Analyzer extension on the reference project', () => {
     assert.deepEqual(disabled, ['SEC-008', 'SEC-009']);
   });
 
-  test('reports all 35 rules with a status', () => {
+  test('reports all 33 rules with a status; SEC-007 and SEC-021 no longer exist', () => {
     const { rules } = run();
-    assert.equal(rules.length, 35);
+    assert.equal(rules.length, 33);
+    assert.ok(!rules.some((r) => r.id === 'SEC-007' || r.id === 'SEC-021'), 'a removed rule is still in the catalogue');
     for (const r of rules) assert.ok(r.status, `${r.id} has no status`);
   });
 
@@ -148,7 +150,6 @@ describeFixture('Security Analyzer extension on the reference project', () => {
     const { unitForFinding } = await import('../dist/analyzer.cjs');
     const result = run();
     for (const f of result.findings) {
-      if (f.ruleId === 'SEC-007') continue; // anchored to a .java file, not a model unit
       assert.ok(unitForFinding(f, result.units), `no unit for ${f.id} (${f.evidence.artifactPath})`);
     }
   });
@@ -192,7 +193,7 @@ describeFixture('SEC-MF rules on the reference project', () => {
     assert.deepEqual(status, {
       'SEC-MF-001': 'WARNING',
       'SEC-MF-002': 'PASSED',
-      'SEC-MF-003': 'WARNING',
+      'SEC-MF-003': 'PASSED',
       // TestApp publishes no REST service, so there is no endpoint to judge.
       'SEC-MF-004': 'NOT_APPLICABLE',
       'SEC-MF-005': 'PASSED',

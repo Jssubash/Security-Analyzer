@@ -16,7 +16,7 @@ export type RuleSeverity = 'Critical' | 'High' | 'Medium' | 'Low' | 'Information
 export type RuleStatus = 'PASS' | 'FAIL' | 'WARNING' | 'NOT_APPLICABLE' | 'ACCEPTED_EXCEPTION';
 
 export interface Evidence {
-  artifactPath: string; // e.g. "Administration.Account"
+  artifactPath: string; // e.g. "Module.Entity"
   objectName: string;   // e.g. "Account"
   objectType: string;   // e.g. "Entity", "Microflow", "Activity", "Endpoint"
   details: Record<string, any>;

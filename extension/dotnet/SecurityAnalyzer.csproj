@@ -25,6 +25,10 @@
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <GenerateDependencyFile>false</GenerateDependencyFile>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Build paths are compiled into the DLL (the debug-symbols path); map the project folder to a
+         neutral one so the published extension carries no developer's user name or folder layout. -->
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/_/SecurityAnalyzer</PathMap>
   </PropertyGroup>
 
   <ItemGroup>

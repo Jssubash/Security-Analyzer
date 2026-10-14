@@ -103,9 +103,35 @@ export interface ReadDiagnostics {
   accessRulesWithRoles: number;
   pages: number;
   pagesWithRoles: number;
+  /** Published REST services found, so "nothing to check" is not confused with "could not read". */
+  publishedRestServices: number;
+  /**
+   * Facts a rule reads that came back unreadable, keyed by {@link UnreadFact}, each with a plain
+   * description. A rule that depends on one of them is reported "Not verified" instead of
+   * "Passed", because finding nothing in a value that was never read proves nothing.
+   */
+  unreadFacts: Partial<Record<UnreadFact, string>>;
   unitTypes?: Record<string, number>;
   unexpectedValueTypes?: Record<string, string>;
 }
+
+export type UnreadFact =
+  | 'securityLevel'
+  | 'checkSecurity'
+  | 'strictPageUrlCheck'
+  | 'enableDemoUsers'
+  | 'demoUserPasswords'
+  | 'enableGuestAccess'
+  | 'guestUserRole'
+  | 'userRoleModuleRoles'
+  | 'userRoleCheckSecurity'
+  | 'userRoleManageAllRoles'
+  | 'adminPassword'
+  | 'passwordPolicy'
+  | 'accessRuleRoles'
+  | 'attributeTypes'
+  | 'entityOwner'
+  | 'applyEntityAccess';
 
 /**
  * A nanoflow's access settings. The IR's `Nanoflow` carries no allowed roles, and the Module
@@ -212,7 +238,8 @@ export function buildIrFromSnapshot(snapshot: ModelSnapshot): SnapshotBuildResul
   }
 
   const applicationType = applicationTypeOf(profiles.map((p) => p.kind));
-  const diagnostics = readDiagnostics(snapshot, securityResult, entities, pages);
+  const diagnostics = readDiagnostics(snapshot, securityResult, entities, pages, microflows, projectSecurityUnits[0]);
+  diagnostics.publishedRestServices = serviceUnits.length;
   addReadWarnings(diagnostics, notes);
 
   const ir: ApplicationIR = {
@@ -255,7 +282,9 @@ function readDiagnostics(
   snapshot: ModelSnapshot,
   security: SecurityResult,
   entities: Record<string, Entity>,
-  pages: Record<string, Page>
+  pages: Record<string, Page>,
+  microflows: Record<string, Microflow>,
+  securityUnit: SnapshotNode | undefined
 ): ReadDiagnostics {
   const model = security.model;
   const guest = model.anonymousRole
@@ -264,6 +293,8 @@ function readDiagnostics(
   const rules = Object.values(entities).flatMap((e) => e.accessRules);
   const pageList = Object.values(pages);
   return {
+    publishedRestServices: 0,
+    unreadFacts: unreadFacts(model, securityUnit, entities, microflows, guest !== undefined),
     guestAccessEnabled: security.analyzability === 'NOT_ANALYZABLE' ? undefined : model.anonymousUserEnabled,
     guestUserRole: model.anonymousRole,
     guestUserRoleFound: guest !== undefined,
@@ -277,6 +308,70 @@ function readDiagnostics(
     unitTypes: snapshot.diagnostics?.unitTypes,
     unexpectedValueTypes: snapshot.diagnostics?.unexpectedValueTypes,
   };
+}
+
+/** Up to three names, then a count, for a readable description. */
+function some(names: string[]): string {
+  return names.length <= 3 ? names.join(', ') : `${names.slice(0, 3).join(', ')} and ${names.length - 3} more`;
+}
+
+/**
+ * The individual facts the rules read that this snapshot did not deliver. Coverage records whole
+ * groups ("project security was read"); this records the single values inside them, because one
+ * unreadable flag is enough to turn a rule's "nothing found" into a pass it did not earn.
+ */
+function unreadFacts(
+  model: SecurityModel,
+  unit: SnapshotNode | undefined,
+  entities: Record<string, Entity>,
+  microflows: Record<string, Microflow>,
+  guestFound: boolean
+): Partial<Record<UnreadFact, string>> {
+  const out: Partial<Record<UnreadFact, string>> = {};
+  if (!unit) return out; // the whole group is NOT_ANALYZABLE and the engine already skips its rules
+  if (!SECURITY_LEVELS.some((l) => l === str(unit, 'SecurityLevel'))) out.securityLevel = 'the security level';
+  if (model.securityEnabled === undefined) out.checkSecurity = 'whether security is switched on (CheckSecurity)';
+  if (model.strictPageUrlCheck === undefined) out.strictPageUrlCheck = 'the strict page URL check setting';
+  if (model.demoUsersEnabled === undefined) out.enableDemoUsers = 'whether demo users are enabled';
+  const demoWithoutPassword = children(unit, 'DemoUsers').filter((u) => secret(u, 'Password') === undefined);
+  if (demoWithoutPassword.length > 0) {
+    out.demoUserPasswords = `the password of demo user(s) ${some(demoWithoutPassword.map((u) => str(u, 'UserName') || '(unnamed)'))}`;
+  }
+  if (bool(unit, 'EnableGuestAccess') === undefined) out.enableGuestAccess = 'whether anonymous (guest) access is enabled';
+  else if (model.anonymousUserEnabled && !guestFound) out.guestUserRole = 'which user role anonymous visitors get';
+  if (model.userRoles.length > 0 && model.userRoles.every((r) => r.moduleRoles.length === 0)) {
+    out.userRoleModuleRoles = 'which module roles each user role holds';
+  }
+  const noCheck = model.userRoles.filter((r) => r.checkSecurity === undefined).map((r) => r.name);
+  if (noCheck.length > 0) out.userRoleCheckSecurity = `the security-check flag of user role(s) ${some(noCheck)}`;
+  const noManage = model.userRoles.filter((r) => r.manageAllRoles === undefined).map((r) => r.name);
+  if (noManage.length > 0) out.userRoleManageAllRoles = `the "manage all roles" flag of user role(s) ${some(noManage)}`;
+  if (model.administrator === undefined || model.administrator.passwordIsWeak === undefined) {
+    out.adminPassword = 'the administrator password';
+  }
+  const policy = model.passwordPolicy;
+  if (
+    !policy ||
+    policy.minimumLength === undefined ||
+    policy.requireDigit === undefined ||
+    policy.requireMixedCase === undefined ||
+    policy.requireSymbol === undefined
+  ) {
+    out.passwordPolicy = 'the password policy settings';
+  }
+
+  const entityList = Object.values(entities);
+  const accessRules = entityList.flatMap((e) => e.accessRules);
+  if (accessRules.length > 0 && accessRules.every((r) => r.moduleRoles.length === 0)) {
+    out.accessRuleRoles = 'which module roles each entity access rule is granted to';
+  }
+  const untyped = entityList.flatMap((e) => e.attributes.filter((a) => a.type === undefined).map((a) => `${e.qualifiedName}.${a.name}`));
+  if (untyped.length > 0) out.attributeTypes = `the type of attribute(s) ${some(untyped)}`;
+  const noOwner = entityList.filter((e) => e.hasOwnerAttribute === undefined && !e.generalization).map((e) => e.qualifiedName);
+  if (noOwner.length > 0) out.entityOwner = `whether entit(ies) ${some(noOwner)} store the owner`;
+  const noEntityAccess = Object.values(microflows).filter((m) => m.appliesEntityAccess === undefined).map((m) => m.qualifiedName);
+  if (noEntityAccess.length > 0) out.applyEntityAccess = `the "Apply entity access" setting of microflow(s) ${some(noEntityAccess)}`;
+  return out;
 }
 
 /** Readings that are almost never true of a real app, reported as probable read failures. */
@@ -389,7 +484,7 @@ function extractSecurity(
   const model: SecurityModel = {
     projectSecurityLevel: level ?? 'CheckNothing',
     isProductionReady: level === 'CheckEverything' && securityEnabled === true,
-    userRoles: extractUserRoles(unit, guestRoleName, notes),
+    userRoles: extractUserRoles(unit, guestRoleName, ref(unit, 'AdminUserRole', 'AdminUserRoleName'), notes),
     moduleRoles,
     anonymousUserEnabled: anonymousEnabled ?? false,
     anonymousRole: guestRoleName,
@@ -408,6 +503,7 @@ function extractSecurity(
 function extractUserRoles(
   unit: SnapshotNode,
   guestRoleName: string | undefined,
+  adminRoleName: string | undefined,
   notes: string[]
 ): UserRole[] {
   const raw = children(unit, 'UserRoles');
@@ -435,7 +531,9 @@ function extractUserRoles(
       moduleRoles: grants,
       manageableRoles: strList(role, 'ManageableRoles'),
       isAnonymous: guestRoleName !== undefined && name === guestRoleName,
-      isAdministrator: (manageAllRoles ?? false) || /^admin/i.test(name),
+      // The role App Security names for MxAdmin, or one named for it — not `ManageAllRoles`, which
+      // is what SEC-024 asks about and so cannot also define who is exempt from it.
+      isAdministrator: name === adminRoleName || /^admin/i.test(name),
       manageAllRoles,
       manageUsersWithoutRoles: bool(role, 'ManageUsersWithoutRoles'),
       checkSecurity: bool(role, 'CheckSecurity'),
@@ -535,7 +633,13 @@ function extractEntities(
         specializations: [],
         attributes: children(raw, 'Attributes').map((a) => toAttribute(a, qualifiedName, notes)),
         indexes: [],
-        accessRules: accessRules.map((r, i) => toAccessRule(r, qualifiedName, i, node.$ID)),
+        accessRules: accessRules.map((r, i) => {
+          const rule = toAccessRule(r, qualifiedName, i, node.$ID);
+          if (!rule.xPathConstraint && str(r, 'XPathConstraintCaption')) {
+            notes.push(`access rule ${i + 1} on ${qualifiedName} has an XPath caption ("${str(r, 'XPathConstraintCaption')}") but no XPath text was read, so it is treated as covering every row; check the rule in Studio Pro`);
+          }
+          return rule;
+        }),
         isSecurityConfigured: accessRules.length > 0,
         hasOwnerAttribute: bool(generalization, 'HasOwnerAttr', 'HasOwner'),
         hasChangedByAttribute: bool(generalization, 'HasChangedByAttr', 'HasChangedBy'),
@@ -549,6 +653,21 @@ function extractEntities(
   for (const entity of Object.values(entities)) {
     if (!entity.generalization) continue;
     entities[entity.generalization]?.specializations.push(entity.qualifiedName);
+  }
+  // A specialization stores no owner flag of its own: it inherits the system members of its
+  // generalization, so a parent that stores the owner makes every specialization owned data too.
+  for (const entity of Object.values(entities)) {
+    if (entity.hasOwnerAttribute !== undefined) continue;
+    const seen = new Set<string>([entity.qualifiedName]);
+    let parent = entity.generalization ? entities[entity.generalization] : undefined;
+    while (parent && !seen.has(parent.qualifiedName)) {
+      seen.add(parent.qualifiedName);
+      if (!parent.generalization) {
+        entity.hasOwnerAttribute = parent.hasOwnerAttribute;
+        break;
+      }
+      parent = entities[parent.generalization];
+    }
   }
   return entities;
 }
@@ -732,6 +851,18 @@ function indexReferences(snapshot: ModelSnapshot, microflows: Record<string, Mic
       if (file.content.includes(`"${name}"`)) list.push({ qualifiedName: file.relativePath, kind: 'JavaSource' });
     }
   }
+  // A constant whose value is a microflow name is how some modules call a configurable
+  // microflow by name at runtime (Core.microflowCall on the constant's value).
+  for (const module of snapshot.modules) {
+    for (const unit of module.units) {
+      if (!isKind(unit, UNIT_TYPES.constant)) continue;
+      const value = str(unit, 'DefaultValue')?.trim();
+      const name = str(unit, 'Name') ?? unit.$Name;
+      const list = value && name ? byName.get(value) : undefined;
+      const referrer = `${module.name}.${name}`;
+      if (list && !list.some((r) => r.qualifiedName === referrer)) list.push({ qualifiedName: referrer, kind: 'Constant' });
+    }
+  }
   for (const [name, list] of byName) {
     list.sort((a, b) => a.qualifiedName.localeCompare(b.qualifiedName));
     microflows[name].referencedBy = list;
@@ -755,6 +886,7 @@ function extractMicroflows(flowUnits: OwnedUnit[], locator: UnitLocator, notes: 
       returnType: 'Unknown',
       parameters: body?.parameters ?? [],
       activities: body?.activities ?? [],
+      returnValues: body?.returnValues,
       cyclomaticComplexity: 0,
       hasErrorHandling: false,
       callsMicroflows: [],
@@ -836,8 +968,27 @@ function resolvePageData(
     const name = str(node, 'Name') ?? node.$Name;
     const page = name ? pages[`${module.name}.${name}`] : undefined;
     if (!page || !has(node, ['$References'])) continue;
-    page.dataEntities = resolveDataEntities(strList(node, '$References'), context);
+    const references = strList(node, '$References');
+    page.dataEntities = resolveDataEntities(references, context);
+    page.references = withSnippetReferences(references, snippetReferences);
   }
+}
+
+/** A page's references plus those of the snippets it embeds, at any depth. */
+function withSnippetReferences(references: string[], snippets: Map<string, string[]>): string[] {
+  const out = new Set(references);
+  const queue = references.filter((r) => snippets.has(r));
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    for (const r of snippets.get(name) ?? []) {
+      out.add(r);
+      if (snippets.has(r)) queue.push(r);
+    }
+  }
+  return [...out].sort();
 }
 
 // ====================================================================== constants
@@ -872,8 +1023,7 @@ function extractConstants(constantUnits: OwnedUnit[], locator: UnitLocator): Ope
 /**
  * Published REST services, for SEC-004.
  *
- * The reference project publishes none, so this mapping is not yet verified against a real
- * service. It is written to fail quiet rather than loud: a service whose authentication setting
+ * It is written to fail quiet rather than loud: a service whose authentication setting
  * cannot be read is skipped with a note, because reporting it as "no authentication" would be a
  * Critical finding built on a missing property.
  */
@@ -933,17 +1083,29 @@ function extractJavaActions(
   modules: Record<string, Module>
 ): JavaActionSummary[] {
   const byLowerName = new Map(Object.keys(modules).map((m) => [m.toLowerCase(), m]));
-  return snapshot.javaSources.map((file) => ({
-    name: file.fileName.replace(/\.java$/i, ''),
-    module: byLowerName.get(file.moduleDirectory.toLowerCase()) ?? file.moduleDirectory,
-    sourceFile: file.relativePath,
-    usesExternalLibraries: [],
-    hasRegexXssSanitizer: usesRegexXssSanitizer(file.content),
-  }));
+  // Classes of each module directory, by simple name, so an action that delegates to a helper of
+  // its own module is judged by the helper's code too.
+  const classes = new Map<string, Map<string, string>>();
+  for (const file of snapshot.javaSources) {
+    const dir = file.moduleDirectory.toLowerCase();
+    if (!classes.has(dir)) classes.set(dir, new Map());
+    classes.get(dir)!.set(file.fileName.replace(/\.java$/i, ''), file.content ?? '');
+  }
+  return snapshot.javaSources.map((file) => {
+    const content = file.content ?? '';
+    const own = classes.get(file.moduleDirectory.toLowerCase()) ?? new Map<string, string>();
+    const helpers = [...own].filter(([name, code]) => code !== content && new RegExp(`\\b${name}\\b`).test(content)).map(([, code]) => code);
+    return {
+      name: file.fileName.replace(/\.java$/i, ''),
+      module: byLowerName.get(file.moduleDirectory.toLowerCase()) ?? file.moduleDirectory,
+      sourceFile: file.relativePath,
+      usesExternalLibraries: [],
+      encrypts: file.content === undefined ? undefined : [content, ...helpers].some(encryptsWithCipher),
+    };
+  });
 }
 
-/** Hand-rolled regex XSS filtering; the same test as the parser's filesystem extractor. */
-export function usesRegexXssSanitizer(source: string): boolean {
-  if (!/replaceAll\s*\(|replaceFirst\s*\(|Pattern\.compile/.test(source)) return false;
-  return /<\s*script|javascript:|onerror\s*=|xss/i.test(source);
+/** Java code that encrypts with the Java platform's own cipher API. */
+function encryptsWithCipher(code: string): boolean {
+  return /\bCipher\b/.test(code) && /\bENCRYPT_MODE\b/.test(code);
 }

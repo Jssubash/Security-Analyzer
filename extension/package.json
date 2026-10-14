@@ -1,6 +1,6 @@
 {
   "name": "@mendix-analyzer/security-analyzer-extension",
-  "version": "1.0.0",
+  "version": "1.0.31",
   "private": true,
   "description": "Mendix Studio Pro extension (10.24+) that runs the SEC-* security governance checks against the open app",
   "scripts": {

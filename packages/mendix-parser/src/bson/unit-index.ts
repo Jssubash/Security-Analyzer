@@ -113,7 +113,7 @@ export class UnitIndex {
       }
 
       const type = elementType(header);
-      // The filename is authoritative for the ID (verified across the fixture), but fall
+      // The filename is authoritative for the ID, but fall
       // back to the parsed $ID so a renamed file still indexes correctly.
       const unitId = basename(absolutePath, '.mxunit') || elementId(header);
       if (!type || !unitId) {

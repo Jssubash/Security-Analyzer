@@ -1,7 +1,9 @@
 using System.ComponentModel.Composition;
 using System.Diagnostics;
+using System.Reflection;
 using System.Text.Json.Nodes;
 using Mendix.StudioPro.ExtensionsAPI.Model;
+using Mendix.StudioPro.ExtensionsAPI.Model.Microflows;
 using Mendix.StudioPro.ExtensionsAPI.Services;
 using Mendix.StudioPro.ExtensionsAPI.UI.DockablePane;
 using Mendix.StudioPro.ExtensionsAPI.UI.Services;
@@ -17,23 +19,26 @@ public sealed class SecurityAnalyzerPane : DockablePaneExtension
 
     private readonly IUntypedModelAccessService untypedModel;
     private readonly IDockingWindowService dockingWindows;
+    private readonly IMicroflowService microflows;
     private readonly ILogService log;
 
     [ImportingConstructor]
     public SecurityAnalyzerPane(
         IUntypedModelAccessService untypedModel,
         IDockingWindowService dockingWindows,
+        IMicroflowService microflows,
         ILogService log)
     {
         this.untypedModel = untypedModel;
         this.dockingWindows = dockingWindows;
+        this.microflows = microflows;
         this.log = log;
     }
 
     public override string Id => PaneId;
 
     public override DockablePaneViewModelBase Open() =>
-        new SecurityAnalyzerPaneViewModel(WebServerBaseUrl, () => CurrentApp, untypedModel, dockingWindows, log)
+        new SecurityAnalyzerPaneViewModel(WebServerBaseUrl, () => CurrentApp, untypedModel, dockingWindows, microflows, log)
         {
             Title = "Security Analyzer",
         };
@@ -49,6 +54,7 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
     private readonly Func<IModel?> currentApp;
     private readonly IUntypedModelAccessService untypedModel;
     private readonly IDockingWindowService dockingWindows;
+    private readonly IMicroflowService microflows;
     private readonly ILogService log;
     private IWebView? webView;
 
@@ -57,12 +63,14 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         Func<IModel?> currentApp,
         IUntypedModelAccessService untypedModel,
         IDockingWindowService dockingWindows,
+        IMicroflowService microflows,
         ILogService log)
     {
         this.baseUrl = baseUrl;
         this.currentApp = currentApp;
         this.untypedModel = untypedModel;
         this.dockingWindows = dockingWindows;
+        this.microflows = microflows;
         this.log = log;
     }
 
@@ -83,10 +91,51 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
                     SendSnapshot();
                     break;
                 case "OpenUnit":
-                    OpenUnit(ReadString(args, "unitId"), ReadString(args, "entity"));
+                    OpenUnit(ReadString(args, "unitId"), ReadString(args, "entity"), ReadString(args, "activity"));
                     break;
                 case "ExportReport":
                     ExportReport(ReadString(args, "fileName"), ReadString(args, "content"));
+                    break;
+                case "CheckVulnerabilities":
+                    CheckVulnerabilities(Field(args, "packages") as JsonArray, ReadString(args, "purpose") ?? "libraries");
+                    break;
+                case "AcceptRisk":
+                    ChangeAcceptedRisks(Field(args, "risk") as JsonObject, revoke: false);
+                    break;
+                case "RevokeRisk":
+                    ChangeAcceptedRisks(Field(args, "risk") as JsonObject, revoke: true);
+                    break;
+                case "MarketplaceTokenStatus":
+                    Post("MarketplaceTokenStatus", new { source = MarketplaceClient.AvailableToken(null).ToString() });
+                    break;
+                case "CheckMarketplace":
+                    CheckMarketplace(ReadString(args, "token"), Field(args, "remember") is JsonValue r && r.TryGetValue<bool>(out var keep) && keep,
+                        Field(args, "contentIds") as JsonArray, Field(args, "catalog") is JsonValue c && c.TryGetValue<bool>(out var wantCatalog) && wantCatalog);
+                    break;
+                case "ForgetMarketplaceToken":
+                    MarketplaceClient.Forget();
+                    Post("MarketplaceTokenStatus", new { source = MarketplaceClient.AvailableToken(null).ToString() });
+                    break;
+                case "OpenMarketplacePage":
+                    if (ReadInt(args, "contentId") is var contentId and > 0)
+                    {
+                        Process.Start(new ProcessStartInfo($"https://marketplace.mendix.com/link/component/{contentId}") { UseShellExecute = true });
+                    }
+                    break;
+                case "OpenLibraryFolder":
+                    OpenLibraryFolder(ReadString(args, "folder"), ReadString(args, "fileName"));
+                    break;
+                case "OpenAdvisory":
+                    OpenAdvisory(ReadString(args, "id"));
+                    break;
+                case "MavenVersions":
+                    FindSafeVersions(args, inspect: false);
+                    break;
+                case "InspectCandidates":
+                    FindSafeVersions(args, inspect: true);
+                    break;
+                case "OpenMavenCentral":
+                    OpenMavenCentral(ReadString(args, "group"), ReadString(args, "artifact"), ReadString(args, "version"));
                     break;
                 case "AnalysisComplete":
                     var failures = ReadInt(args, "failures");
@@ -98,6 +147,302 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         catch (Exception ex)
         {
             log.Error($"Security Analyzer: handling '{args.Message}' failed", ex);
+        }
+    }
+
+    private CancellationTokenSource? vulnerabilityCheck;
+
+    /// <summary>
+    /// Looks the app's Java libraries up in OSV.dev (see <see cref="OsvClient"/>), off the UI
+    /// thread, and posts the answer back on the thread the request came in on.
+    /// </summary>
+    private void CheckVulnerabilities(JsonArray? packages, string purpose)
+    {
+        if (packages is null || packages.Count == 0)
+        {
+            Post("VulnerabilityResult", new { ok = false, purpose, error = "There are no libraries with known names and versions to check." });
+            return;
+        }
+        vulnerabilityCheck?.Cancel();
+        var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+        vulnerabilityCheck = cancel;
+        var context = SynchronizationContext.Current;
+        var request = (JsonArray)packages.DeepClone();
+        void Reply(object data)
+        {
+            if (context is null) Post("VulnerabilityResult", data);
+            else context.Post(_ => Post("VulnerabilityResult", data), null);
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                var watch = Stopwatch.StartNew();
+                var result = await new OsvClient().CheckAsync(request, cancel.Token);
+                log.Info($"Security Analyzer: checked {request.Count} {purpose} packages against OSV.dev in {watch.ElapsedMilliseconds} ms");
+                Reply(new { ok = true, purpose, json = result.ToJsonString() });
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Security Analyzer: the vulnerability check failed: {ex.Message}");
+                var reason = ex is TaskCanceledException or OperationCanceledException
+                    ? "the check timed out"
+                    : ex is HttpRequestException ? $"OSV.dev could not be reached ({ex.Message})" : ex.Message;
+                Reply(new { ok = false, purpose, error = $"The vulnerability check failed: {reason}. Check the internet connection or proxy and try again." });
+            }
+        });
+    }
+
+    private CancellationTokenSource? versionSearch;
+
+    /// <summary>
+    /// The "safe version" lookup behind How to resolve, in two calls from the pane: first the release
+    /// lists of the vulnerable libraries (<c>MavenVersions</c>), then, for the few candidate releases
+    /// the pane picks from them, what is inside each jar and whether OSV.dev knows advisories for it
+    /// (<c>InspectCandidates</c>). Replies with <c>VersionAdviceResult</c>.
+    /// </summary>
+    private void FindSafeVersions(MessageReceivedEventArgs args, bool inspect)
+    {
+        versionSearch?.Cancel();
+        var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(4));
+        versionSearch = cancel;
+        var context = SynchronizationContext.Current;
+        var stage = inspect ? "inspect" : "versions";
+        void Reply(object data)
+        {
+            if (context is null) Post("VersionAdviceResult", data);
+            else context.Post(_ => Post("VersionAdviceResult", data), null);
+        }
+        var libraries = (Field(args, "libraries") as JsonArray)?.Select(n => n?.GetValue<string>()).OfType<string>().ToList() ?? new List<string>();
+        var candidates = (Field(args, "candidates") as JsonArray)?.DeepClone() as JsonArray ?? new JsonArray();
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                var watch = Stopwatch.StartNew();
+                var maven = new MavenClient();
+                if (!inspect)
+                {
+                    var versions = await maven.VersionsAsync(libraries, cancel.Token);
+                    log.Info($"Security Analyzer: read {libraries.Count} release lists from Maven Central in {watch.ElapsedMilliseconds} ms");
+                    Reply(new { ok = true, stage, json = versions.ToJsonString() });
+                    return;
+                }
+                var packages = new JsonArray(candidates.OfType<JsonObject>()
+                    .Select(c => (JsonNode?)new JsonObject { ["name"] = $"{c["group"]}:{c["artifact"]}", ["version"] = c["version"]?.GetValue<string>() })
+                    .ToArray());
+                var jarsTask = maven.InspectAsync(candidates, cancel.Token);
+                var osvTask = new OsvClient().CheckAsync(packages, cancel.Token);
+                await Task.WhenAll(jarsTask, osvTask);
+                log.Info($"Security Analyzer: inspected {candidates.Count} candidate releases in {watch.ElapsedMilliseconds} ms");
+                var osvIds = new JsonObject();
+                foreach (var r in (osvTask.Result["results"] as JsonArray ?? new JsonArray()).OfType<JsonObject>())
+                {
+                    osvIds[$"{r["name"]}@{r["version"]}"] = r["ids"]?.DeepClone();
+                }
+                Reply(new { ok = true, stage, json = new JsonObject { ["jars"] = jarsTask.Result, ["osv"] = osvIds }.ToJsonString() });
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Security Analyzer: the safe-version lookup failed: {ex.Message}");
+                var reason = ex is TaskCanceledException or OperationCanceledException ? "it timed out" : ex.Message;
+                Reply(new { ok = false, stage, error = $"Maven Central could not be checked: {reason}" });
+            }
+        });
+    }
+
+    private void OpenMavenCentral(string? group, string? artifact, string? version)
+    {
+        var page = MavenClient.ReleasePage(group, artifact, version);
+        if (page is null) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(page.AbsoluteUri) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: could not open {page}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Records or revokes an accepted-risk decision in the app folder; see <see cref="AcceptedRiskStore"/>.</summary>
+    private void ChangeAcceptedRisks(JsonObject? risk, bool revoke)
+    {
+        var directory = currentApp()?.Root.DirectoryPath;
+        if (string.IsNullOrEmpty(directory) || risk is null)
+        {
+            Post("AcceptedRisks", new { ok = false, error = "The app directory is not known, so the decision cannot be saved." });
+            return;
+        }
+        try
+        {
+            var result = revoke ? AcceptedRiskStore.Revoke(directory, risk) : AcceptedRiskStore.Accept(directory, risk);
+            log.Info($"Security Analyzer: {(revoke ? "revoked" : "recorded")} an accepted risk in {AcceptedRiskStore.RelativePath}");
+            Post("AcceptedRisks", new { ok = true, json = result.ToJsonString() });
+        }
+        catch (Exception ex)
+        {
+            Post("AcceptedRisks", new { ok = false, error = ex is ArgumentException ? ex.Message : $"{AcceptedRiskStore.RelativePath} could not be updated: {ex.Message}" });
+        }
+    }
+
+    private CancellationTokenSource? marketplaceCheck;
+
+    /// <summary>
+    /// Fetches version histories (and, for widget matching, the catalog) from the Marketplace
+    /// Content API off the UI thread; see <see cref="MarketplaceClient"/> for what is sent and how
+    /// the token is kept. The token itself never goes back to the pane.
+    /// </summary>
+    private void CheckMarketplace(string? typedToken, bool remember, JsonArray? contentIds, bool catalog)
+    {
+        MarketplaceClient? client;
+        try
+        {
+            client = MarketplaceClient.Create(typedToken, remember);
+        }
+        catch (Exception ex)
+        {
+            Post("MarketplaceResult", new { ok = false, error = $"The token could not be stored: {ex.Message}" });
+            return;
+        }
+        if (client is null)
+        {
+            Post("MarketplaceResult", new { ok = false, needsToken = true, error = "A Mendix Personal Access Token is needed to read version information from the Marketplace." });
+            return;
+        }
+        var ids = (contentIds ?? new JsonArray())
+            .Select(n => n is JsonValue v && v.TryGetValue<int>(out var i) ? i : 0)
+            .Where(i => i > 0).Distinct().ToList();
+
+        marketplaceCheck?.Cancel();
+        var cancel = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        marketplaceCheck = cancel;
+        var context = SynchronizationContext.Current;
+        var source = MarketplaceClient.AvailableToken(typedToken).ToString();
+        void Reply(object data)
+        {
+            if (context is null) Post("MarketplaceResult", data);
+            else context.Post(_ => Post("MarketplaceResult", data), null);
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                var watch = Stopwatch.StartNew();
+                var versions = new JsonObject();
+                using var gate = new SemaphoreSlim(6);
+                var fetched = await Task.WhenAll(ids.Select(async id =>
+                {
+                    await gate.WaitAsync(cancel.Token);
+                    try
+                    {
+                        return (id, list: (JsonNode?)await client.VersionsAsync(id, cancel.Token), error: (string?)null);
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        return (id, list: (JsonNode?)null, error: (string?)ex.Message);
+                    }
+                    finally
+                    {
+                        gate.Release();
+                    }
+                }));
+                var failures = new JsonObject();
+                foreach (var (id, list, error) in fetched)
+                {
+                    if (list is not null) versions[id.ToString()] = list;
+                    else failures[id.ToString()] = error;
+                }
+                var result = new JsonObject
+                {
+                    ["checkedAt"] = DateTime.UtcNow.ToString("o"),
+                    ["versions"] = versions,
+                    ["failures"] = failures,
+                };
+                if (catalog) result["catalog"] = await client.CatalogAsync(cancel.Token);
+                log.Info($"Security Analyzer: read {ids.Count} Marketplace version lists{(catalog ? " and the catalog" : "")} in {watch.ElapsedMilliseconds} ms");
+                Reply(new { ok = true, json = result.ToJsonString(), tokenSource = source });
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                if (remember) MarketplaceClient.Forget();
+                Reply(new { ok = false, needsToken = true, error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Security Analyzer: the Marketplace check failed: {ex.Message}");
+                var reason = ex is TaskCanceledException or OperationCanceledException ? "the check timed out" : ex.Message;
+                Reply(new { ok = false, error = $"The Marketplace could not be read: {reason}. Check the internet connection or proxy and try again." });
+            }
+        });
+    }
+
+    /// <summary>
+    /// Shows a jar in Windows Explorer, selected in its folder — what Studio Pro's own
+    /// App ▸ Show App Directory in Explorer does for the app directory, which the extensions API
+    /// gives as <c>IProject.DirectoryPath</c>. The path is built here from that directory: the pane
+    /// only names <c>userlib</c>, <c>vendorlib</c> or <c>widgets</c> and a file name, and anything that would
+    /// resolve outside those folders is refused.
+    /// </summary>
+    private void OpenLibraryFolder(string? folder, string? fileName)
+    {
+        try
+        {
+            var directory = currentApp()?.Root.DirectoryPath;
+            if (string.IsNullOrEmpty(directory) || folder is not ("userlib" or "vendorlib" or "widgets"))
+            {
+                Post("OpenFolderResult", new { ok = false, error = "The app directory is not known." });
+                return;
+            }
+            var libraryFolder = Path.GetFullPath(Path.Combine(directory, folder));
+            if (!Directory.Exists(libraryFolder))
+            {
+                Post("OpenFolderResult", new { ok = false, error = $"{folder} does not exist in the app directory any more." });
+                return;
+            }
+
+            string arguments;
+            var valid = !string.IsNullOrEmpty(fileName) && fileName == Path.GetFileName(fileName)
+                && fileName.EndsWith(folder == "widgets" ? ".mpk" : ".jar", StringComparison.OrdinalIgnoreCase);
+            var file = valid ? Path.GetFullPath(Path.Combine(libraryFolder, fileName!)) : null;
+            if (file is not null && file.StartsWith(libraryFolder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) && File.Exists(file))
+            {
+                arguments = $"/select,\"{file}\"";
+            }
+            else
+            {
+                // The jar is gone (synchronised away, deleted): open its folder instead.
+                arguments = $"\"{libraryFolder}\"";
+                Post("OpenFolderResult", new { ok = true, error = (string?)$"{fileName} is no longer in {folder}; opened the folder instead." });
+            }
+            Process.Start(new ProcessStartInfo("explorer.exe", arguments) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: could not open the folder of {folder}/{fileName}: {ex.Message}");
+            Post("OpenFolderResult", new { ok = false, error = $"Windows Explorer could not be opened: {ex.Message}" });
+        }
+    }
+
+    /// <summary>Opens an advisory's osv.dev page in the default browser. Only osv.dev pages, built from the id.</summary>
+    private void OpenAdvisory(string? id)
+    {
+        var page = OsvClient.AdvisoryPage(id);
+        if (page is null) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(page.AbsoluteUri) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: could not open {page}: {ex.Message}");
         }
     }
 
@@ -131,13 +476,28 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
     /// domain model, so a model with fifty entities does not leave the developer searching the
     /// canvas for the one the finding names.
     /// </summary>
-    private void OpenUnit(string? unitId, string? entityQualifiedName)
+    private void OpenUnit(string? unitId, string? entityQualifiedName, string? activityId = null)
     {
         var app = currentApp();
         if (app is null || string.IsNullOrEmpty(unitId))
         {
             Post("OpenUnitResult", new { ok = false, error = "No app is open." });
             return;
+        }
+
+        if (!string.IsNullOrEmpty(activityId))
+        {
+            if (TryOpenActivity(app, unitId, activityId))
+            {
+                Post("OpenUnitResult", new { ok = true, error = (string?)null });
+                return;
+            }
+            // The activity was not found (changed since the analysis): open the microflow itself.
+            if (TryOpenById(app, unitId) || TryOpenByName(app, unitId))
+            {
+                Post("OpenUnitResult", new { ok = true, error = (string?)"The activity was not found any more; opened the microflow. Run the analysis again." });
+                return;
+            }
         }
 
         if (!string.IsNullOrEmpty(entityQualifiedName) && TryOpenEntity(app, entityQualifiedName))
@@ -224,6 +584,10 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
             var document = unit is null ? null : FieldValueOfType(unit, "IStorageObject");
             if (document is null) return false;
 
+            // Studio Pro's own opener first: it shows dialog-style documents (App Security, …) as
+            // their dialog and everything else in a tab, which is what the Errors pane uses.
+            if (TryOpenWithDocumentViewManager(document, unitId)) return true;
+
             foreach (var candidate in FieldValues(dockingWindows).Prepend(dockingWindows))
             {
                 var editDocument = candidate.GetType().GetInterfaces().Prepend(candidate.GetType())
@@ -242,9 +606,59 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         }
         catch (Exception ex)
         {
-            log.Warn($"Security Analyzer: opening {unitId} through the editor manager failed: {ex.Message}");
+            log.Warn($"Security Analyzer: opening {unitId} through the editor manager failed: {Reason(ex)}");
         }
         return false;
+    }
+
+    /// <summary>
+    /// Opens a document through Studio Pro's <c>IDocumentViewManager.EditDocument</c>, resolved from
+    /// Studio Pro's service locator. In 10.x this is the opener that knows which documents have a
+    /// modal editor — App Security is a dialog, not a tab — while the docking service only reaches
+    /// the tab manager, which throws for them. In 11.x the interface no longer opens documents and
+    /// the method is absent, so this returns false and the editor manager (which handles dialogs
+    /// there) is used instead.
+    /// </summary>
+    private bool TryOpenWithDocumentViewManager(object document, string unitId)
+    {
+        try
+        {
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            var locator = assemblies.Select(a => a.GetType("Mendix.Modeler.Utility.DIContainer.ServiceLocator", throwOnError: false)).FirstOrDefault(t => t is not null);
+            var viewManagerType = assemblies.Select(a => a.GetType("Mendix.Modeler.Common.IDocumentViewManager", throwOnError: false)).FirstOrDefault(t => t is not null);
+            var editDocument = viewManagerType?.GetMethods().FirstOrDefault(m => m.Name == "EditDocument" && m.GetParameters().Length is 1 or 2);
+            var resolve = locator?.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+                .FirstOrDefault(m => m.Name == "ObsoleteResolve" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+            if (viewManagerType is null || editDocument is null || resolve is null) return false;
+            if (!editDocument.GetParameters()[0].ParameterType.IsInstanceOfType(document)) return false;
+
+            var viewManager = resolve.MakeGenericMethod(viewManagerType).Invoke(null, null);
+            if (viewManager is null) return false;
+
+            var parameters = editDocument.GetParameters();
+            var arguments = new object?[parameters.Length];
+            arguments[0] = document;
+            // FocusInfo is a struct: its default focuses nothing in particular.
+            for (var i = 1; i < parameters.Length; i++)
+            {
+                var type = parameters[i].ParameterType;
+                arguments[i] = type.IsValueType && Nullable.GetUnderlyingType(type) is null ? Activator.CreateInstance(type) : null;
+            }
+            editDocument.Invoke(viewManager, arguments);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: opening {unitId} through the document view manager failed: {Reason(ex)}");
+            return false;
+        }
+    }
+
+    /// <summary>The real failure behind a reflection call, rather than "the target of an invocation threw".</summary>
+    private static string Reason(Exception ex)
+    {
+        while (ex is System.Reflection.TargetInvocationException { InnerException: { } inner }) ex = inner;
+        return $"{ex.GetType().Name}: {ex.Message}";
     }
 
     private const System.Reflection.BindingFlags InstanceFields =
@@ -276,6 +690,18 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         return null;
     }
 
+    /// <summary>
+    /// App-level documents, which belong to no module: App Security (where every project-security
+    /// finding points), Navigation and App Settings. Each name with its storage spelling, and where
+    /// the App Explorer shows it.
+    /// </summary>
+    private static readonly (string Type, string Location)[] ProjectDocuments =
+    {
+        ("Security$ProjectSecurity", "App ▸ Security"),
+        ("Navigation$NavigationDocument", "App ▸ Navigation"),
+        ("Settings$ProjectSettings", "App ▸ Settings"),
+    };
+
     private Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelUnit? FindUntypedUnitObject(IModel app, string unitId)
     {
         var root = untypedModel.GetUntypedModel(app);
@@ -283,6 +709,29 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         {
             var unit = module.GetUnits().FirstOrDefault(u => u.ID.ToString() == unitId);
             if (unit is not null) return unit;
+        }
+        return FindProjectDocument(root, unitId)?.Unit;
+    }
+
+    private static (Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelUnit Unit, string Location)? FindProjectDocument(
+        Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelRoot root, string unitId)
+    {
+        foreach (var (type, location) in ProjectDocuments)
+        {
+            foreach (var candidate in new[] { type, type + "Impl" })
+            {
+                IReadOnlyList<Mendix.StudioPro.ExtensionsAPI.Model.UntypedModel.IModelUnit> units;
+                try
+                {
+                    units = root.GetUnitsOfType(candidate);
+                }
+                catch
+                {
+                    continue; // a spelling this Studio Pro version does not know
+                }
+                var unit = units.FirstOrDefault(u => u.ID.ToString() == unitId);
+                if (unit is not null) return (unit, location);
+            }
         }
         return null;
     }
@@ -320,6 +769,7 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         try
         {
             var root = untypedModel.GetUntypedModel(app);
+            if (FindProjectDocument(root, unitId) is { } project) return (null, project.Location);
             foreach (var module in root.GetUnitsOfType("Projects$Module"))
             {
                 var descendants = module.GetUnits().ToList();
@@ -341,6 +791,57 @@ internal sealed class SecurityAnalyzerPaneViewModel : WebViewDockablePaneViewMod
         }
         return (null, null);
     }
+
+    /// <summary>
+    /// Opens a microflow with one of its activities selected, so the developer lands on the step a
+    /// finding names instead of searching a large canvas. The activity is looked up by its id among
+    /// all activities, including those inside loops.
+    /// </summary>
+    private bool TryOpenActivity(IModel app, string unitId, string activityId)
+    {
+        try
+        {
+            if (!app.TryGetAbstractUnitById(unitId, out var unit) || unit is not IMicroflow microflow) return false;
+            var activity = microflows.GetAllMicroflowActivities(microflow).FirstOrDefault(a => SameId(ElementId(a), activityId));
+            if (activity is null)
+            {
+                log.Warn($"Security Analyzer: activity {activityId} was not found in {unitId}");
+                return false;
+            }
+            return dockingWindows.TryOpenEditor(microflow, activity);
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Security Analyzer: could not select activity {activityId} in {unitId}: {Reason(ex)}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The id of a typed model element. The Extensions API does not expose element ids, so this
+    /// reads the <c>Original</c> Studio Pro element the typed wrapper carries and takes its
+    /// <c>Id</c> — the same id the untyped model (and so the snapshot) reports. <c>null</c> when a
+    /// Studio Pro version shapes its wrappers differently.
+    /// </summary>
+    private static string? ElementId(object element)
+    {
+        const BindingFlags All = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        var original = element.GetType().GetProperty("Original", All)?.GetValue(element);
+        foreach (var candidate in new[] { original, element })
+        {
+            if (candidate is null) continue;
+            var type = candidate.GetType();
+            var id = type.GetProperty("Id", All) ?? type.GetProperty("ID", All)
+                ?? type.GetInterfaces().Select(i => i.GetProperty("Id") ?? i.GetProperty("ID")).FirstOrDefault(p => p is not null);
+            var value = id?.GetValue(candidate)?.ToString();
+            if (!string.IsNullOrEmpty(value)) return value;
+        }
+        return null;
+    }
+
+    private static bool SameId(string? a, string b) =>
+        a is not null && (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)
+            || (Guid.TryParse(a, out var ga) && Guid.TryParse(b, out var gb) && ga == gb));
 
     /// <summary>
     /// Opens the domain model owning <paramref name="qualifiedName"/> with the entity selected.

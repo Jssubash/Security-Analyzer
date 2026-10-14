@@ -33,8 +33,8 @@ export interface ScoreReport {
    *
    * `overallScore` is still a number when this is true — it is the penalty per rule that
    * *ran* — but it is then a score for a partial assessment and must never be shown on its
-   * own. Removing the reference project's `Security$ProjectSecurity` unit takes the overall
-   * score from 79 to 100 precisely because the rules that were failing could no longer run,
+   * own. An app whose `Security$ProjectSecurity` unit cannot be read can score higher than the
+   * same app read in full, precisely because the rules that were failing could no longer run,
    * so this flag, not the number, is what tells a reader the two are not comparable.
    */
   assessmentIsIncomplete: boolean;
@@ -69,9 +69,9 @@ const SEVERITY_WEIGHTS: Record<RuleSeverity, number> = {
  * Facts without which a category cannot be scored at all, even when its other facts were read.
  *
  * This is separate from `CATEGORY_FACTS` because "all the facts were unreadable" is too weak a
- * test. With no `Security$ProjectSecurity` unit the reference project still has readable module
- * roles, access rules and pages, so nine Security rules run and pass and the category scores
- * 100 — higher than the 65 it scores when the security model *is* readable. An analyzer that
+ * test. Without a readable `Security$ProjectSecurity` unit an app can still have readable module
+ * roles, access rules and pages, so the rules that need only those run and pass and the category
+ * scores higher than it does when the security model *is* readable. An analyzer that
  * rewards an unreadable model is the §2.1 defect, and §4.2 calls for the score to be suppressed
  * rather than computed from whichever rules happened to survive.
  */
@@ -157,8 +157,8 @@ export class ScoringEngine {
     //
     // Unless something a category cannot be scored without was unreadable, in which case
     // there is no compliance figure at all. Dropping the failing rules out of the ratio
-    // *raises* it — the reference project reports 64 % with its security model readable and
-    // 90 % with that one unit removed — and §9.5 requires that a less readable project never
+    // *raises* it — an app with one security unit unreadable would report a higher figure than
+    // the same app read in full — and §9.5 requires that a less readable project never
     // produce a higher compliance score. The only number that cannot be read as an
     // improvement is no number.
     if (missingCriticalFacts.size > 0) {

@@ -20,7 +20,7 @@ import type { NanoflowAccess } from './snapshot/build-ir.js';
 export type AccessState = 'complete' | 'incomplete' | 'review' | 'empty';
 
 export interface RoleGrant {
-  /** Qualified module role, e.g. `MyFirstModule.User`. */
+  /** Qualified module role, `Module.Role`. */
   role: string;
   /** Human-readable rights, e.g. `create · delete · read 5 · write 2 · XPath`. */
   rights: string;

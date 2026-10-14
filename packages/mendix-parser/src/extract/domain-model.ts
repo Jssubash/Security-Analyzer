@@ -238,7 +238,7 @@ function toIndex(raw: BsonDocument): IndexItem {
  *
  * `AllowedModuleRoles` holds qualified `Module.Role` strings, which is what makes it
  * possible to ask whether a rule grants access to a role the guest user role also holds —
- * the question SEC-020 and SEC-021 exist to answer.
+ * the question SEC-003, SEC-020 and SEC-029 exist to answer.
  */
 function toAccessRule(
   raw: BsonDocument,

@@ -12,7 +12,8 @@
     "build:web": "npm run build -w extension",
     "build:dotnet": "dotnet build extension/dotnet/SecurityAnalyzer.csproj -c Release",
     "build": "npm run build:packages && npm run build:web && npm run build:dotnet",
-    "test": "npm run build:packages && npm run build:web && node --test \"tests/**/*.test.mjs\" \"extension/tests/**/*.test.mjs\""
+    "test": "npm run build:packages && npm run build:web && node --test \"tests/**/*.test.mjs\" \"extension/tests/**/*.test.mjs\"",
+    "package": "npm run build && node extension/scripts/package-module.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

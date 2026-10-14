@@ -121,9 +121,7 @@ describeFixture('extractor golden counts for the reference project', () => {
     assert.equal(ir.customCode.javaActions.length, 3);
     // The old parser counted these 73 JavaScript action files as nanoflows.
     assert.equal(ir.customCode.javaScriptActions.length, 73);
-    const sanitizer = ir.customCode.javaActions.find((a) => a.name === 'XSS_Sanitizer');
-    assert.ok(sanitizer);
-    assert.equal(sanitizer.hasRegexXssSanitizer, true);
+    assert.ok(ir.customCode.javaActions.some((a) => a.name === 'XSS_Sanitizer'));
   });
 
   it('marks the one navigation home page, so a public front door is not a finding', async () => {

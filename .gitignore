@@ -12,3 +12,7 @@ fixtures/
 
 *.log
 .DS_Store
+
+# Packaging: the temporary host app, and the generated add-on module package (.mxmodule)
+.package/
+release/

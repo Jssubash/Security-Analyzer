@@ -7,8 +7,8 @@
  * loads the app.
  *
  * Module attribution is the correction here. The old extractor guessed the owning module,
- * which is how the fixture's only constant — `FeedbackModule.LocalStorageKey`, a marketplace
- * module's browser storage key — came to be reported against the user's own code.
+ * which is how a Marketplace module's own constant came to be reported against the user's
+ * own code.
  *
  * SECURITY — a secret-shaped value is classified, then dropped. `defaultValue` is retained
  * only for constants the classifier judges non-sensitive, because the IR is written to

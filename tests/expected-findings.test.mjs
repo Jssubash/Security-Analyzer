@@ -33,7 +33,6 @@ const EXPECTED = [
   'SEC-006-Atlas_Core.User | WARNING | Medium',
   'SEC-006-Atlas_Web_Content.User | WARNING | Medium',
   'SEC-006-MyFirstModule.User | FAIL | Critical',
-  'SEC-007-FeedbackModule.XSS_Sanitizer | WARNING | Medium',
   'SEC-012-enabled | FAIL | High',
   'SEC-013-demo_administrator | FAIL | High',
   'SEC-013-demo_user | FAIL | High',
@@ -44,8 +43,6 @@ const EXPECTED = [
   'SEC-020-MyFirstModule.RequestForm.Email#1 | FAIL | High',
   'SEC-020-MyFirstModule.RequestForm.Name#1 | FAIL | High',
   'SEC-020-MyFirstModule.RequestForm.PhoneNumber#1 | FAIL | High',
-  'SEC-021-MyFirstModule.RequestForm.Email#1 | FAIL | High',
-  'SEC-021-MyFirstModule.RequestForm.PhoneNumber#1 | FAIL | High',
   'SEC-028-Atlas_Core.DS_Account_CurrentUser | WARNING | High',
   'SEC-029-MyFirstModule.RequestForm#1 | FAIL | High',
   'SEC-EE-003-Administration.AccountPasswordData#1 | WARNING | Medium',
@@ -154,20 +151,21 @@ describeFixture('expected findings for the reference project', () => {
 
   it('counts outcomes the way the score divides them', async () => {
     const summary = await fixtureEvaluation();
-    assert.equal(summary.totalRulesEvaluated, 38);
+    // SEC-007 (one Medium warning) and SEC-021 (two High failures) were removed from the catalogue.
+    assert.equal(summary.totalRulesEvaluated, 36);
     assert.equal(summary.totalPassed, 23);
-    assert.equal(summary.totalFailed, 15);
-    assert.equal(summary.totalWarnings, 10);
+    assert.equal(summary.totalFailed, 13);
+    assert.equal(summary.totalWarnings, 9);
     assert.deepEqual(summary.severityBreakdown, {
       Critical: 5,
-      High: 10,
-      Medium: 8,
+      High: 8,
+      Medium: 7,
       Low: 2,
       Informational: 0,
     });
     // `rulesPassed + rulesViolated` is the denominator, so it must exclude the skips.
     const security = summary.categoryBreakdown.Security;
-    assert.equal(security.rulesPassed + security.rulesViolated, 27);
+    assert.equal(security.rulesPassed + security.rulesViolated, 25);
     assert.equal(security.rulesNotApplicable, 6);
   });
 
@@ -178,13 +176,14 @@ describeFixture('expected findings for the reference project', () => {
     const score = new ScoringEngine().calculateScores(summary, ir.coverage);
 
     // SEC-029 (docs/security.md §6.9) added one failing rule: 79 → 78, Compliance 64 → 62.
-    assert.equal(score.overallScore, 78);
+    // Removing SEC-007 and SEC-021 (both violated on this project): 78 → 79, Compliance 61 → 64.
+    assert.equal(score.overallScore, 79);
     // Five Critical findings: the rating is driven by severity, not just the average.
     assert.equal(score.riskRating, 'F');
     assert.equal(score.categoryScores.Security, 65);
     assert.equal(score.categoryScores.Architecture, 100);
     // SEC-EE-003 (docs/security.md §6.12) added one rule that warns: Compliance 62 → 61.
-    assert.equal(score.categoryScores.Compliance, 61);
+    assert.equal(score.categoryScores.Compliance, 64);
     assert.equal(score.notApplicableCount, 16);
 
     // Categories with no rule outcomes are absent rather than 100 — a perfect score for
@@ -200,12 +199,12 @@ describeFixture('expected findings for the reference project', () => {
     const summary = await fixtureEvaluation();
     for (const finding of summary.findings) {
       assert.ok(finding.evidence?.artifactPath, `${finding.id} has no artifactPath`);
-      // `sourceSkill` names an mxcli MDL skill document (e.g. manage-security.md). Those documents
-      // belong to the mxcli tooling and are not redistributed here, so the citation is checked for
-      // shape rather than for a file on disk.
-      assert.match(finding.sourceSkill, /^[a-z0-9-]+\.md$/, `${finding.id} cites "${finding.sourceSkill}"`);
+      assert.ok(
+        existsSync(join(REPO_ROOT, 'skills', finding.sourceSkill)),
+        `${finding.id} cites skills/${finding.sourceSkill}, which does not exist`
+      );
 
-      // Not every finding is anchored to a unit — SEC-007 points at a .java file — but a
+      // Not every finding is anchored to a unit, but a
       // `unitPath` that is present must resolve, or the evidence cannot be followed up.
       const unitPath = finding.evidence.details?.unitPath;
       if (unitPath) {

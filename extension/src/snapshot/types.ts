@@ -53,6 +53,12 @@ export interface SnapshotModule {
   name: string;
   /** `Projects$Module.FromAppStore`, when readable. */
   fromAppStore?: boolean;
+  /** The Marketplace content id the module was installed from (e.g. 170 for Community Commons). */
+  appStorePackageId?: number | null;
+  /** The Marketplace version installed. */
+  appStoreVersion?: string | null;
+  appStoreVersionGuid?: string | null;
+  isThemeModule?: boolean | null;
   unitId?: string;
   /** Units owned by the module: security, domain model, pages, microflows, constants, services. */
   units: SnapshotNode[];
@@ -67,6 +73,64 @@ export interface JavaSourceFile {
   content: string;
 }
 
+/** Maven coordinates read from a jar's `META-INF/maven/<group>/<artifact>/pom.properties`. */
+export interface PomProperties {
+  groupId?: string;
+  artifactId: string;
+  version?: string;
+  /** Entry path inside the jar. */
+  path: string;
+}
+
+/** One `.jar` file under `userlib/` or `vendorlib/`. */
+export interface JarFileFacts {
+  folder: 'userlib' | 'vendorlib';
+  fileName: string;
+  sizeBytes: number;
+  sha256?: string;
+  /** Every pom.properties inside the jar: its own, and those of libraries shaded into it. */
+  pomProperties?: PomProperties[];
+  /** Identifying manifest attributes (Implementation-*, Bundle-*, Automatic-Module-Name). */
+  manifest?: Record<string, string>;
+  /** Jars packed inside this jar (fat jars), which are counted but not opened. */
+  nestedJars?: number;
+  /** Why the jar could not be opened, if it could not. */
+  unreadable?: string;
+}
+
+/** `vendorlib/vendorlib-sbom.json` (CycloneDX), reduced to coordinates and the dependency graph. */
+export interface VendorlibSbom {
+  components: { ref?: string; group?: string; name?: string; version?: string; sha256?: string }[];
+  dependencies: { ref?: string; dependsOn: (string | null)[] }[];
+}
+
+export interface JavaLibrariesSnapshot {
+  /** False when the app directory was unknown, so nothing could be scanned. */
+  scanned: boolean;
+  jars: JarFileFacts[];
+  /** `userlib/<jar>.<Module>.RequiredLib` marker files: which module needs which userlib jar. */
+  requiredLibMarkers: { jarFileName: string; module: string }[];
+  sbom?: VendorlibSbom;
+}
+
+/** One widget package (`widgets/*.mpk`). */
+export interface WidgetPackageFacts {
+  fileName: string;
+  /** `<clientModule name>` from package.xml. */
+  name?: string | null;
+  /** `<clientModule version>` from package.xml. */
+  version?: string | null;
+  widgets?: { id: string; name?: string | null; pluginWidget?: boolean; supportedPlatform?: string | null }[];
+  /** npm libraries bundled into the widget, from its dependencies.json / dependencies.txt. */
+  dependencies?: { name: string; version: string; transitive?: boolean }[];
+  unreadable?: string;
+}
+
+export interface WidgetsSnapshot {
+  scanned: boolean;
+  packages: WidgetPackageFacts[];
+}
+
 export interface ModelSnapshot {
   schemaVersion: number;
   /** Where the snapshot came from; `studio-pro` in production, `mprcontents` in tests. */
@@ -76,11 +140,19 @@ export interface ModelSnapshot {
     directory?: string;
     /** Studio Pro version hosting the extension, e.g. `10.24.0.73019`. */
     studioProVersion?: string;
+    /** The app's Java version from its runtime settings, e.g. `Java21`. Absent from older hosts. */
+    javaVersion?: string;
   };
   /** Project-level units: `Security$ProjectSecurity`, `Navigation$NavigationDocument`. */
   projectUnits: SnapshotNode[];
   modules: SnapshotModule[];
   javaSources: JavaSourceFile[];
+  /** The jars in `userlib/` and `vendorlib/`. Absent from hosts that predate the Java libraries tab. */
+  javaLibraries?: JavaLibrariesSnapshot;
+  /** The widget packages in `widgets/`. Absent from hosts that predate the Upgrades tab. */
+  widgets?: WidgetsSnapshot;
+  /** Accepted-risk decisions from `.security-analyzer/accepted-risks.json` in the app folder. */
+  acceptedRisks?: import('../accepted-risks.js').AcceptedRisksFile;
   /** Anything the host could not read, in plain language. */
   notes: string[];
   /**
@@ -89,6 +161,11 @@ export interface ModelSnapshot {
    * events, workflows, published services, project settings. Absent from hosts that predate it.
    */
   referenceIndex?: { referrer: string; kind: string; references: string[] }[];
+  /**
+   * Each pluggable widget id placed in the app, with the pages, snippets and layouts that place it.
+   * Absent from hosts that predate it, which leaves widget usage unknown.
+   */
+  widgetUsage?: Record<string, string[]>;
   /** What the host saw, for troubleshooting a snapshot that reads less than expected. */
   diagnostics?: {
     /** Every unit type found under a module, with a count. */
