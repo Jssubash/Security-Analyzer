@@ -15,6 +15,7 @@ export type HostMessage =
   | { message: 'ExportDone'; data: { path?: string; error?: string } }
   | { message: 'OpenUnitResult'; data: { ok: boolean; error?: string; name?: string; location?: string } }
   | { message: 'VulnerabilityResult'; data: { ok: boolean; json?: string; error?: string; purpose?: string } }
+  | { message: 'VersionAdviceResult'; data: { ok: boolean; stage: 'versions' | 'inspect'; json?: string; error?: string } }
   | { message: 'OpenFolderResult'; data: { ok: boolean; error?: string } }
   | { message: 'AcceptedRisks'; data: { ok: boolean; json?: string; error?: string } }
   | { message: 'MarketplaceTokenStatus'; data: { source: 'None' | 'Typed' | 'Remembered' | 'Environment' } }

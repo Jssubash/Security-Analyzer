@@ -66,25 +66,34 @@ describe('inventory', () => {
     );
   });
 
-  test('widgets that ship inside a module are attributed to it', () => {
+  test('a widget is attributed to a module only when the module has its name and version', () => {
     const w = Object.fromEntries(inv.widgets.map((x) => [x.fileName, x]));
-    assert.equal(w['com.mendix.widget.web.Datagrid.mpk'].bundledWith, 'DataWidgets');
-    assert.equal(w['com.mendix.widget.native.Maps.mpk'].bundledWith, 'NativeMobileResources');
     assert.equal(w['com.mendix.widget.web.FileUploader.mpk'].bundledWith, 'FileUploader', 'same name, same version as the module');
+    // No fixed list: a widget whose module the model does not show is not assigned to one.
+    assert.equal(w['com.mendix.widget.web.Datagrid.mpk'].bundledWith, undefined);
+    assert.equal(w['com.mendix.widget.native.Maps.mpk'].bundledWith, undefined);
     assert.equal(w['Badge.mpk'].bundledWith, undefined);
     assert.deepEqual(w['com.mendix.widget.native.Maps.mpk'].platforms, ['Native']);
   });
 
-  test('standalone widgets are matched to catalog widgets by name, preferring Mendix for Mendix widgets, never guessing', () => {
+  test('each widget carries the namespace its ids share, read from the package', () => {
+    const family = Object.fromEntries(inv.widgets.map((x) => [x.fileName, x.family]));
+    assert.equal(family['com.mendix.widget.native.Maps.mpk'], 'com.mendix.widget.native');
+    assert.equal(family['com.mendix.widget.web.Datagrid.mpk'], 'com.mendix.widget.web');
+    assert.equal(family['Badge.mpk'], 'com.mendix.widget.custom');
+    assert.equal(family['AcmeChart.mpk'], 'com.acme');
+  });
+
+  test('standalone widgets are matched to catalog widgets by name, never guessing between several', () => {
     const catalog = [
-      { contentId: 50, name: 'Badge', type: 'Widget', publisher: 'Mendix' },
-      { contentId: 51, name: 'Maps', type: 'Widget', publisher: 'Mendix' },
-      { contentId: 52, name: 'Maps', type: 'Widget', publisher: 'Someone' },
-      { contentId: 53, name: 'Badge', type: 'Module', publisher: 'Mendix' },
+      { contentId: 50, name: 'Badge', type: 'Widget', publisher: 'Vendor A' },
+      { contentId: 51, name: 'Maps', type: 'Widget', publisher: 'Vendor A' },
+      { contentId: 52, name: 'Maps', type: 'Widget', publisher: 'Vendor B' },
+      { contentId: 53, name: 'Badge', type: 'Module', publisher: 'Vendor A' },
     ];
     const matches = matchWidgets(inv, catalog);
-    assert.deepEqual(matches, { 'widget:Badge.mpk': 50, 'widget:Maps.mpk': 51 });
-    assert.deepEqual(contentIdsToCheck(inv, matches), [50, 51, 170, 109513, 116540, 235351]);
+    assert.deepEqual(matches, { 'widget:Badge.mpk': 50 });
+    assert.deepEqual(contentIdsToCheck(inv, matches), [50, 170, 109513, 116540, 235351]);
   });
 });
 
@@ -145,14 +154,27 @@ describe('the version to use for a target Mendix version', () => {
 
   test('a bundled widget follows its module', () => {
     const inv = buildUpgradeInventory(snapshot());
-    const grid = inv.widgets.find((w) => w.bundledWith === 'DataWidgets');
-    const owner = assessItem(inv.modules.find((m) => m.name === 'DataWidgets'), [
-      { versionNumber: '2.5.0', minSupportedMendixVersion: '9.24.0' },
-      { versionNumber: '3.11.6', minSupportedMendixVersion: '10.24.0' },
+    const widget = inv.widgets.find((w) => w.bundledWith === 'FileUploader');
+    const owner = assessItem(inv.modules.find((m) => m.name === 'FileUploader'), [
+      { versionNumber: '2.2.1', minSupportedMendixVersion: '9.24.0' },
+      { versionNumber: '3.0.0', minSupportedMendixVersion: '10.24.0' },
     ], '10.24.0');
-    const a = assessWidget(grid, assessItem(grid, undefined, '10.24.0'), owner);
+    const a = assessWidget(widget, assessItem(widget, undefined, '10.24.0'), owner);
     assert.equal(a.status, 'update-recommended');
-    assert.match(a.note, /Ships with the DataWidgets module and is updated with it/);
+    assert.match(a.note, /Ships with the FileUploader module and is updated with it/);
+  });
+
+  test('a name match whose releases all predate the installed widget is a different item', () => {
+    const maps = buildUpgradeInventory(snapshot()).widgets.find((w) => w.fileName === 'com.mendix.widget.native.Maps.mpk');
+    const a = assessItem({ ...maps, contentId: 77 }, [{ versionNumber: '1.0.6', minSupportedMendixVersion: '9.0.0' }], '10.24.0');
+    assert.equal(a.status, 'not-found');
+    assert.match(a.note, /stops at 1.0.6, below the installed 5.1.1, so it is a different item/);
+    assert.match(a.note, /probably installed by a Marketplace module/);
+  });
+
+  test('a widget the Marketplace does not list on its own says it was probably installed by a module', () => {
+    const acme = buildUpgradeInventory(snapshot()).widgets.find((w) => w.fileName === 'AcmeChart.mpk');
+    assert.match(assessItem(acme, undefined, '10.24.0').note, /Not on the Marketplace on its own: probably installed by a Marketplace module/);
   });
 
   test('versions typed as 10.24 are read as 10.24.0', () => {
@@ -171,6 +193,7 @@ describe('widget vulnerabilities', async () => {
       { name: '@mendix/widget-plugin-platform', version: '0.2.0' },
     ];
     s.widgets.packages.find((p) => p.fileName === 'com.mendix.widget.web.Datagrid.mpk').dependencies = [{ name: 'mobx', version: '6.12.3' }];
+    s.widgets.packages.find((p) => p.fileName === 'com.mendix.widget.web.FileUploader.mpk').dependencies = [{ name: 'mobx', version: '6.12.3' }];
     return buildUpgradeInventory(s);
   }
   const advisory = (id, pkg, fixed, severity = 'MODERATE') => ({
@@ -224,26 +247,46 @@ describe('widget vulnerabilities', async () => {
 
   test('a bundled widget whose module is already on the newest release is not told to update to it', () => {
     const inv = inventory();
-    const grid = inv.widgets.find((w) => w.bundledWith === 'DataWidgets');
-    const module = { ...inv.modules.find((m) => m.name === 'DataWidgets'), installedVersion: '3.11.6' };
-    const owner = assess(module, [
-      { versionNumber: '3.11.6', minSupportedMendixVersion: '10.24.0' },
+    const widget = inv.widgets.find((w) => w.bundledWith === 'FileUploader');
+    const owner = assess(inv.modules.find((m) => m.name === 'FileUploader'), [
+      { versionNumber: '2.2.1', minSupportedMendixVersion: '10.24.0' },
       { versionNumber: '4.0.0', minSupportedMendixVersion: '11.6.0' },
     ], '10.24.0');
     const vuln = [{ id: 'X', cves: [], summary: 's', severity: 'High', package: 'mobx', version: '6.12.3', bundled: true, fixedIn: '6.13.0', cwes: [] }];
-    const advice = widgetSecurityAdvice({ ...grid, moduleVersion: '3.11.6' }, vuln, assessWidget(grid, { status: 'not-checked', note: '' }, owner), '10.24.0');
-    assert.match(advice, /The installed DataWidgets 3.11.6 is already the newest release for Mendix 10.24.0, and it still bundles mobx 6.12.3/);
+    const advice = widgetSecurityAdvice(widget, vuln, assessWidget(widget, { status: 'not-checked', note: '' }, owner), '10.24.0');
+    assert.match(advice, /The installed FileUploader 2.2.1 is already the newest release for Mendix 10.24.0, and it still bundles mobx 6.12.3/);
     assert.match(advice, /Updating from the Marketplace will not change it. 4.0.0 is newer but needs Mendix 11.6.0/);
   });
 
   test('a vulnerable widget that ships with a module is fixed by updating that module', () => {
     const inv = inventory();
-    const grid = inv.widgets.find((w) => w.bundledWith === 'DataWidgets');
-    const owner = assess(inv.modules.find((m) => m.name === 'DataWidgets'), [
-      { versionNumber: '2.5.0', minSupportedMendixVersion: '9.24.0' },
-      { versionNumber: '3.11.6', minSupportedMendixVersion: '10.24.0' },
+    const widget = inv.widgets.find((w) => w.bundledWith === 'FileUploader');
+    const owner = assess(inv.modules.find((m) => m.name === 'FileUploader'), [
+      { versionNumber: '2.2.1', minSupportedMendixVersion: '9.24.0' },
+      { versionNumber: '3.0.0', minSupportedMendixVersion: '10.24.0' },
     ], '10.24.0');
     const vuln = [{ id: 'X', cves: [], summary: 's', severity: 'High', package: 'mobx', version: '6.12.3', bundled: true, fixedIn: '6.13.0', cwes: [] }];
-    assert.match(widgetSecurityAdvice(grid, vuln, assessWidget(grid, { status: 'not-checked', note: '' }, owner), '10.24.0'), /Update the DataWidgets module to 3.11.6/);
+    assert.match(widgetSecurityAdvice(widget, vuln, assessWidget(widget, { status: 'not-checked', note: '' }, owner), '10.24.0'), /Update the FileUploader module to 3.0.0/);
   });
 });
+
+describe('widget usage', () => {
+  test('lists the pages, snippets and layouts that place each widget, matching ids without case', () => {
+    const inv = buildUpgradeInventory({
+      ...snapshot(),
+      widgetUsage: {
+        'com.mendix.widget.native.maps.maps': ['Shop.Map_Native', 'Shop.Store_Native'],
+        'com.acme.AcmeChart': ['Shop.Dashboard'],
+      },
+    });
+    const usedIn = (fileName) => inv.widgets.find((w) => w.fileName === fileName).usedIn;
+    assert.deepEqual(usedIn('com.mendix.widget.native.Maps.mpk'), ['Shop.Map_Native', 'Shop.Store_Native']);
+    assert.deepEqual(usedIn('AcmeChart.mpk'), ['Shop.Dashboard']);
+    assert.deepEqual(usedIn('Badge.mpk'), []);
+  });
+
+  test('leaves usage unknown when the snapshot does not record it', () => {
+    assert.equal(buildUpgradeInventory(snapshot()).widgets[0].usedIn, undefined);
+  });
+});
+

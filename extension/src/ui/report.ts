@@ -10,6 +10,7 @@ import type { SecurityAnalysisResult } from '../analyze.js';
 import { duplicateAdvice, gaOf, remediation } from '../java-libraries.js';
 import type { LibraryVulnerability, VulnerabilityReport } from '../java-libraries.js';
 import type { WidgetVulnerabilityReport } from '../marketplace.js';
+import { acceptedByText } from '../accepted-risks.js';
 import type { AcceptedRisk } from '../accepted-risks.js';
 
 /** What the pane knows beyond the analysis itself: the checks run since, and the team's decisions. */
@@ -47,7 +48,7 @@ function acceptedRisksSection(risks: AcceptedRisk[] | undefined): string {
   const rows = risks
     .map(
       (r) =>
-        `<tr><td><strong>${e(r.advisoryId)}</strong></td><td>${e(r.scope === 'widget' ? `widget ${r.target}` : r.target)}</td><td>${e(`${r.package} ${r.version}`)}</td><td>${e(r.reason)}</td><td>${e(r.acceptedBy ?? '')}<br><span class="muted">${e(r.acceptedAt ? new Date(r.acceptedAt).toLocaleDateString() : '')}</span></td><td>${e(r.reviewBy)}${r.reviewBy < today ? ' <span class="pill sev-high">review overdue</span>' : ''}</td></tr>`
+        `<tr><td><strong>${e(r.advisoryId)}</strong></td><td>${e(r.scope === 'widget' ? `widget ${r.target}` : r.target)}</td><td>${e(`${r.package} ${r.version}`)}</td><td>${e(r.reason)}</td><td>${e(acceptedByText(r).who)}${acceptedByText(r).detail ? `<br><span class="muted">${e(acceptedByText(r).detail!)}</span>` : ''}<br><span class="muted">${e(r.acceptedAt ? new Date(r.acceptedAt).toLocaleDateString() : '')}</span></td><td>${e(r.reviewBy)}${r.reviewBy < today ? ' <span class="pill sev-high">review overdue</span>' : ''}</td></tr>`
     )
     .join('');
   return `<p class="muted">Advisories the team reviewed and accepted. An accepted advisory does not count as open until its review date; an overdue one counts again.</p><table><thead><tr><th>Advisory</th><th>Where</th><th>Library</th><th>Reason</th><th>Accepted by</th><th>Review by</th></tr></thead><tbody>${rows}</tbody></table>`;

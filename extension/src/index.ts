@@ -8,3 +8,4 @@ export * from './module-status.js';
 export * from './java-libraries.js';
 export * from './marketplace.js';
 export * from './accepted-risks.js';
+export * from './version-advice.js';

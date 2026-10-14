@@ -1,5 +1,6 @@
 /**
- * The `SEC-*` catalogue: 29 rules — the 28 of `docs/security.md` §6, plus SEC-029 (§6.9).
+ * The `SEC-*` catalogue: 27 rules — those of `docs/security.md` §6, plus SEC-029 (§6.9). SEC-007
+ * (regex-based XSS sanitiser) and SEC-021 (sensitive member readable by a broad role) were removed.
  *
  * Two things are different from the catalogue this replaces.
  *
@@ -11,9 +12,8 @@
  *
  * Second, the anonymous-access rules traverse the real one-step indirection — a user role
  * holds module roles, and an unauthenticated visitor holds the guest user role's module roles.
- * The previous versions pattern-matched role *names*, which is why a project whose guest role
- * holds `Atlas_Core.Administrator` and `Atlas_Web_Content.Administrator` reported no anonymous
- * findings at all.
+ * The previous versions pattern-matched role *names*, so a guest role holding another module's
+ * administrator role produced no anonymous findings at all.
  *
  * SECURITY: no rule below puts a password or a secret-shaped constant value into `Evidence`.
  * Findings are persisted to `data/runs/*.json` and embedded in exported HTML reports, so a
@@ -21,12 +21,12 @@
  * is reporting. Evidence carries the location and the classification only.
  */
 
-import type { AccessRights, Page } from '@mendix-analyzer/application-ir';
+import type { AccessRights, Activity, ApplicationIR, Page } from '@mendix-analyzer/application-ir';
+import type { RuleSeverity } from '@mendix-analyzer/rule-engine';
 
 import { defineRule } from './define-rule.js';
 import { microflowSecurityRules } from './microflow-security.js';
 import {
-  broadModuleRoles,
   entityAccessRules,
   grantedModuleRoles,
   guestHasAccessTo,
@@ -35,6 +35,9 @@ import {
   isAdministratorRole,
   isGuestDesignatedRole,
   isPersistableEntity,
+  isUserFacingWithoutEntityAccess,
+  dataAccess,
+  stepList,
   isPlatformModule,
   isUserModule,
   piiAttributes,
@@ -42,6 +45,17 @@ import {
   secretAttributes,
   sensitivityLabel,
 } from './security-facts.js';
+import type { DataAccess } from './security-facts.js';
+
+/** One severity step down, for a Marketplace module the team cannot change in place. */
+function lower(severity: RuleSeverity): RuleSeverity {
+  return severity === 'Critical' ? 'High' : severity === 'High' ? 'Medium' : 'Low';
+}
+
+/** One severity step up, when the anonymous role can reach it. */
+function raise(severity: RuleSeverity): RuleSeverity {
+  return severity === 'Low' ? 'Medium' : severity === 'Medium' ? 'High' : 'Critical';
+}
 
 const SECURITY_SKILL = 'manage-security.md';
 
@@ -53,10 +67,155 @@ const PASSWORD_POLICY_BASELINE = {
   requireSymbol: true,
 };
 
+/** Secret-classifier terms for values an app only verifies; SEC-005 suggests hashing these first. */
+const VERIFY_ONLY_TERMS = new Set(['password', 'passwd', 'pwd', 'pin']);
+
+/** One place a microflow writes a secret attribute (SEC-005). */
+interface SecretWrite {
+  microflow: string;
+  activity: string;
+  /** The value comes straight from the result of a Java action whose code encrypts. */
+  encrypted: boolean;
+  /** For an encrypted write: the Java action. */
+  via?: string;
+  /** A plain write replaced by an encrypted one before anything commits the object. */
+  overwritten: boolean;
+  /** The value is a text typed into the model. */
+  literal: boolean;
+}
+
+/**
+ * Every Create or Change object activity that sets `member`, and whether the value it stores is
+ * encrypted. A value is encrypted when it is a variable holding an encrypted result, which comes
+ * from:
+ *   - a Java action whose own code encrypts (Java's Cipher in ENCRYPT_MODE — read from the
+ *     source, whichever module the action is in);
+ *   - a sub-microflow that returns such a value;
+ *   - a Create or Change variable that copies such a variable.
+ * A plain value that an encrypted one replaces before the object is committed never reaches the
+ * database. `undefined` when microflow contents were not read.
+ */
+function secretWrites(ir: ApplicationIR, member: string): { writes: SecretWrite[] } | undefined {
+  if (ir.coverage?.microflowActivities === 'NOT_ANALYZABLE') return undefined;
+  const tracker = encryptionTracker(ir);
+  const writes: SecretWrite[] = [];
+  for (const mf of Object.values(ir.microflows)) {
+    const acts = mf.activities;
+    const held = new Map<string, string>();
+    for (let i = 0; i < acts.length; i++) {
+      const a = acts[i]!;
+      tracker.step(a, held);
+      if (a.type !== 'CreateAction' && a.type !== 'ChangeAction') continue;
+      const set = (a.properties.members as { attribute?: string; value: string }[] | undefined)?.find((m) => m.attribute === member);
+      if (!set) continue;
+      const value = set.value.trim();
+      const via = tracker.encryptedValue(value, held);
+      const target = String(a.type === 'CreateAction' ? a.properties.outputVariable : a.properties.variable);
+      writes.push({
+        microflow: mf.qualifiedName,
+        activity: a.type === 'CreateAction' ? 'Create object' : 'Change object',
+        encrypted: via !== undefined,
+        via,
+        overwritten: via === undefined && overwrittenBeforeCommit(acts, i, member, target, held, tracker),
+        literal: /^'(?:[^']|'')+'$/.test(value),
+      });
+    }
+  }
+  return { writes };
+}
+
+type EncryptionTracker = {
+  /** Updates `held` (variable → what encrypted it) for one activity. */
+  step: (a: Activity, held: Map<string, string>) => void;
+  /** What encrypted the value of an expression that is just a variable, or `undefined`. */
+  encryptedValue: (expression: string, held: Map<string, string>) => string | undefined;
+};
+
+function encryptionTracker(ir: ApplicationIR): EncryptionTracker {
+  const encrypting = new Map(
+    ir.customCode.javaActions.filter((j) => j.encrypts).map((j) => [`${j.module}.${j.name}`.toLowerCase(), `${j.module}.${j.name}`])
+  );
+  const returns = new Map<string, string | undefined>();
+
+  const encryptedValue = (expression: string, held: Map<string, string>) => {
+    const variable = /^\$(\w+)$/.exec(expression.trim())?.[1];
+    return variable ? held.get(variable) : undefined;
+  };
+
+  // What encrypted a microflow's result, when every end event returns an encrypted variable.
+  const returnsEncrypted = (name: string): string | undefined => {
+    if (returns.has(name)) return returns.get(name);
+    returns.set(name, undefined); // a recursive call cannot prove itself
+    const mf = ir.microflows[name];
+    let result: string | undefined;
+    if (mf && mf.returnValues && mf.returnValues.length > 0) {
+      const held = new Map<string, string>();
+      for (const a of mf.activities) step(a, held);
+      const vias = mf.returnValues.map((v) => encryptedValue(v, held));
+      if (vias.every((v) => v !== undefined)) result = `${name} (${vias[0]})`;
+    }
+    returns.set(name, result);
+    return result;
+  };
+
+  const step = (a: Activity, held: Map<string, string>) => {
+    const output = a.properties.outputVariable;
+    const callee = a.properties.callee;
+    if (a.type === 'JavaActionCall' && typeof output === 'string') {
+      const via = typeof callee === 'string' ? encrypting.get(callee.toLowerCase()) : undefined;
+      if (via) held.set(output, via);
+      else held.delete(output);
+    } else if (a.type === 'MicroflowCall' && typeof output === 'string') {
+      const via = typeof callee === 'string' ? returnsEncrypted(callee) : undefined;
+      if (via) held.set(output, via);
+      else held.delete(output);
+    } else if (a.type === 'CreateVariable' || a.type === 'ChangeVariable') {
+      const variable = a.type === 'CreateVariable' ? output : a.properties.variable;
+      if (typeof variable !== 'string') return;
+      const via = typeof a.properties.value === 'string' ? encryptedValue(a.properties.value, held) : undefined;
+      if (via) held.set(variable, via);
+      else held.delete(variable);
+    }
+  };
+
+  return { step, encryptedValue };
+}
+
+/** Whether a later activity sets `member` on `target` to an encrypted value before `target` is committed. */
+function overwrittenBeforeCommit(
+  acts: Activity[],
+  index: number,
+  member: string,
+  target: string,
+  heldBefore: Map<string, string>,
+  tracker: EncryptionTracker
+): boolean {
+  if (committedBy(acts[index]!)) return false;
+  const held = new Map(heldBefore);
+  for (let j = index + 1; j < acts.length; j++) {
+    const a = acts[j]!;
+    tracker.step(a, held);
+    const onTarget = a.properties.variable === target;
+    if (a.type === 'ChangeAction' && onTarget) {
+      const set = (a.properties.members as { attribute?: string; value: string }[] | undefined)?.find((m) => m.attribute === member);
+      if (set && tracker.encryptedValue(set.value, held)) return true;
+      if (committedBy(a)) return false;
+    }
+    if (a.type === 'CommitAction' && onTarget) return false;
+  }
+  return false;
+}
+
+/** A Create or Change object whose "Commit" setting stores the object. */
+function committedBy(a: Activity): boolean {
+  const commit = a.properties.commit;
+  return typeof commit === 'string' && commit !== 'No';
+}
+
 /** Member access levels that let a role read the member's value. */
 const READABLE: AccessRights[] = ['ReadOnly', 'ReadWrite'];
 
-/** The last segment of a qualified member name, e.g. `…RequestForm.Email` → `Email`. */
+/** The last segment of a qualified member name: `Module.Entity.Attribute` → `Attribute`. */
 function memberName(qualified: string): string {
   const dot = qualified.lastIndexOf('.');
   return dot >= 0 ? qualified.slice(dot + 1) : qualified;
@@ -838,73 +997,6 @@ const coreSecurityRules = [
   }),
 
   defineRule({
-    id: 'SEC-021',
-    name: 'Sensitive or PII member readable by a broad role',
-    description:
-      'Members classified as secret or PII must not be readable by a module role granted to several user roles.',
-    category: 'Security',
-    subcategory: 'Data Privacy',
-    severity: 'High',
-    sourceSkill: SECURITY_SKILL,
-    sourceSection: 'Member Access',
-    expectedPractice:
-      'Grant read access to sensitive and personal members through a dedicated module role held by the roles that need it.',
-    recommendation:
-      'Set the member to None on this rule and grant it through a narrower module role.',
-    whyItMatters:
-      'A module role held by several user roles reaches a wider audience than its name suggests, so a sensitive member readable through it is visible to users the modeller was not considering — including, when one of those user roles is the guest, unauthenticated visitors.',
-    // Medium: the classification is a name match. Where a second structural fact corroborates
-    // it the corroboration is named in the evidence, per §6.6.
-    confidence: 'Medium',
-    requires: ['entityAccessRules', 'attributeTypes'],
-    check: (ir, emit) => {
-      const broad = broadModuleRoles(ir);
-      if (broad.size === 0) return;
-      const guestRoles = guestModuleRoles(ir);
-
-      for (const { entity, rule, ordinal } of entityAccessRules(ir)) {
-        const via = rolesInCommon(rule, broad);
-        if (via.length === 0) continue;
-
-        const classified = new Map(
-          [...secretAttributes(entity), ...piiAttributes(entity)].map((a) => [a.name, a])
-        );
-        if (classified.size === 0) continue;
-
-        for (const member of rule.memberAccess) {
-          if (!READABLE.includes(member.access)) continue;
-          const attribute = classified.get(memberName(member.attributeOrAssociation));
-          if (!attribute) continue;
-
-          const guestHeld = via.filter((r) => guestRoles.has(r));
-          emit({
-            key: `${entity.qualifiedName}.${attribute.name}#${ordinal}`,
-            module: entity.module,
-            // Stays at the rule's High even when the guest holds the role. SEC-020 already
-            // reports guest reachability on the same member with its own severity, and raising
-            // this one to Critical would score a single mis-set member twice at the top weight.
-            // The guest involvement is stated in the observation instead.
-            artifact: `Member: ${entity.qualifiedName}.${attribute.name}`,
-            observation: `Attribute "${attribute.name}" on "${entity.qualifiedName}" is classified ${sensitivityLabel(attribute)} and is ${member.access} for module role(s) ${via.join(', ')}, each granted to more than one user role${guestHeld.length > 0 ? `, including the guest role via ${guestHeld.join(', ')}` : ''}.`,
-            objectName: attribute.name,
-            objectType: 'Attribute',
-            artifactPath: member.attributeOrAssociation,
-            details: {
-              access: member.access,
-              attributeType: attribute.type ?? null,
-              sensitivityKind: attribute.sensitivityKind,
-              sensitivityTerm: attribute.sensitivityTerm,
-              broadRoles: via,
-              guestHeldRoles: guestHeld,
-              unitPath: rule.provenance?.unitPath,
-            },
-          });
-        }
-      }
-    },
-  }),
-
-  defineRule({
     id: 'SEC-022',
     name: 'Owned-data entity without an XPath constraint',
     description:
@@ -1015,19 +1107,20 @@ const coreSecurityRules = [
 
   defineRule({
     id: 'SEC-005',
-    name: 'Password or secret attribute not hashed',
+    name: 'Password or secret attribute stored as plain text',
     description:
-      'Attributes whose name identifies a credential must use the HashedString type.',
+      'Attributes of persistable entities whose name identifies a credential must not be stored as plain text: hash the value when the app only verifies it, or encrypt it before commit when the app must read it back.',
     category: 'Security',
     subcategory: 'Data Privacy',
     severity: 'High',
     sourceSkill: SECURITY_SKILL,
     sourceSection: 'Password and Sensitive Attributes',
-    expectedPractice: 'Store credentials in a HashedString attribute.',
+    expectedPractice:
+      "Choose by use case. A value the app only has to verify — a user's password or PIN — belongs in a HashedString attribute: it is hashed on commit and can be compared, but never read back. A value the app has to use again — an API key, access token or client secret it sends to another service — cannot be hashed. Encrypt it before commit with the EncryptString Java action from the Encryption module (Marketplace) and decrypt it with DecryptString where it is used, keeping the 32-character key in the Encryption.EncryptionKey constant, set per environment rather than in the model.",
     recommendation:
-      'Change the attribute type to HashedString, or remove the attribute if the credential is held elsewhere.',
+      'If the app only verifies this value, change the attribute type to HashedString. If the app needs the original value back, keep it a String but store it encrypted: call EncryptString (Encryption module) before committing and DecryptString where the value is used. If the credential is held elsewhere, remove the attribute.',
     whyItMatters:
-      'A String attribute is stored in the database as typed and appears in backups, database exports and OData feeds. HashedString applies the project\'s configured hash on commit so the stored value cannot be read back.',
+      'A String attribute is stored exactly as typed: it appears in database backups and exports and in OData or REST feeds, and anyone with database access can read it. HashedString stores a one-way hash, so the value cannot be read back — right for passwords, but it breaks a token or key the app has to send on. Encrypting with the Encryption module keeps the stored value unreadable without the key while the app can still decrypt it.',
     // High rather than Medium: the real attribute type is read from the model, so the name
     // match is corroborated by a structural fact (§6.6).
     confidence: 'High',
@@ -1035,24 +1128,88 @@ const coreSecurityRules = [
     check: (ir, emit) => {
       for (const entity of Object.values(ir.entities)) {
         if (!isUserModule(ir, entity.module)) continue;
+        // A non-persistable entity is never written to the database, so nothing about it is
+        // stored as plain text. Persistence follows the generalization chain, as at runtime.
+        if (!isPersistableEntity(ir, entity.qualifiedName)) continue;
 
         for (const attribute of secretAttributes(entity)) {
           if (attribute.type === 'HashedString') continue;
           // An unreadable type cannot support the claim; `attributeTypes` coverage carries it.
           if (attribute.type === undefined) continue;
 
+          const member = `${entity.qualifiedName}.${attribute.name}`;
+          const flow = secretWrites(ir, member);
+          const pages = Object.values(ir.pages)
+            .filter((p) => p.references?.includes(member))
+            .map((p) => p.qualifiedName)
+            .sort();
+          const encrypted = flow?.writes.filter((w) => w.encrypted) ?? [];
+          const plain = flow?.writes.filter((w) => !w.encrypted && !w.overwritten) ?? [];
+          const literals = flow?.writes.filter((w) => w.literal) ?? [];
+          const where = (list: SecretWrite[]) => [...new Set(list.map((w) => `${w.activity} in ${w.microflow}`))].join('; ');
+
+          // Every write in a microflow goes through an encrypting Java action, and no page edits it.
+          if (encrypted.length > 0 && plain.length === 0 && pages.length === 0 && literals.length === 0) continue;
+          // Encrypted in the microflows, but a page may also save what a user types.
+          const review = encrypted.length > 0 && plain.length === 0;
+
+          const parts: string[] = [];
+          if (!flow) {
+            parts.push(`Attribute "${attribute.name}" on "${entity.qualifiedName}" is classified ${sensitivityLabel(attribute)} and has type "${attribute.type}", so it is stored as plain text unless the app encrypts it before commit.`);
+          } else if (encrypted.length === 0) {
+            parts.push(
+              `Attribute "${attribute.name}" on "${entity.qualifiedName}" is classified ${sensitivityLabel(attribute)} and has type "${attribute.type}", and no microflow writes it through a Java action that encrypts (one whose code uses Java's Cipher in ENCRYPT_MODE)${plain.length > 0 ? `: it is written as plain text in ${where(plain)}` : ''}.`
+            );
+          } else if (plain.length > 0) {
+            parts.push(
+              `Attribute "${attribute.name}" on "${entity.qualifiedName}" is encrypted before it is stored in ${where(encrypted)}, but written as plain text in ${where(plain)}.`
+            );
+          } else {
+            parts.push(
+              `Attribute "${attribute.name}" on "${entity.qualifiedName}" is encrypted before it is stored in every microflow that writes it (${where(encrypted)}).`
+            );
+          }
+          if (pages.length > 0) {
+            parts.push(
+              `Page${pages.length === 1 ? '' : 's'} ${pages.slice(0, 3).join(', ')}${pages.length > 3 ? ` and ${pages.length - 3} more` : ''} also refer${pages.length === 1 ? 's' : ''} to it: if a Save there commits what the user types without calling the encrypting microflow, that value is stored as plain text.`
+            );
+          }
+          if (literals.length > 0) {
+            parts.push(
+              `A plain value for it is typed into the model in ${where(literals)}: anyone with access to the app model or its repository can read it. Set it at runtime or from a constant set per environment instead.`
+            );
+          }
+
           emit({
-            key: `${entity.qualifiedName}.${attribute.name}`,
+            key: member,
             module: entity.module,
-            artifact: `Attribute: ${entity.qualifiedName}.${attribute.name}`,
-            observation: `Attribute "${attribute.name}" on "${entity.qualifiedName}" is classified ${sensitivityLabel(attribute)} but has type "${attribute.type}" rather than HashedString.`,
+            status: review ? 'WARNING' : 'FAIL',
+            severity: review ? 'Medium' : 'High',
+            artifact: `Attribute: ${member}`,
+            observation: parts.join(' '),
+            // Lead with the option the matched word suggests: a password or PIN is only ever
+            // verified, so it is hashed; a token, key or secret is sent on, so it is encrypted.
+            recommendation: review
+              ? [
+                  literals.length > 0 ? 'Remove the value typed into the model and pass the real value in at runtime (or from a constant set per environment).' : '',
+                  pages.length > 0 ? 'Check that every page that edits this attribute saves through the microflow that encrypts it, not with a plain Save button.' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')
+              : VERIFY_ONLY_TERMS.has(attribute.sensitivityTerm ?? '')
+              ? `"${attribute.name}" looks like a value the app only verifies: change its type to HashedString. If the app does need the original value back, keep it a String and store it encrypted with EncryptString / DecryptString from the Encryption module instead.`
+              : `"${attribute.name}" looks like a value the app has to send on, which a hash would destroy: keep it a String and store it encrypted — EncryptString (Encryption module) before committing, DecryptString where it is used, with the key in the Encryption.EncryptionKey constant. If the app only verifies it, change its type to HashedString instead.`,
             objectName: attribute.name,
             objectType: 'Attribute',
             artifactPath: `${entity.qualifiedName}.${attribute.name}`,
             details: {
               currentType: attribute.type,
-              expectedType: 'HashedString',
+              suggested: VERIFY_ONLY_TERMS.has(attribute.sensitivityTerm ?? '') ? 'HashedString' : 'encrypt with the Encryption module',
               sensitivityTerm: attribute.sensitivityTerm,
+              encryptedIn: encrypted.map((w) => `${w.activity} in ${w.microflow} (via ${w.via})`),
+              plainIn: plain.map((w) => `${w.activity} in ${w.microflow}`),
+              typedIntoModel: literals.map((w) => `${w.activity} in ${w.microflow}`),
+              pages,
               unitPath: entity.provenance?.unitPath,
             },
           });
@@ -1228,62 +1385,8 @@ const coreSecurityRules = [
   }),
 
   // ---------------------------------------------------------------------------------------
-  // 6.5 Custom code, constants & integration
+  // 6.5 Constants & integration
   // ---------------------------------------------------------------------------------------
-
-  defineRule({
-    id: 'SEC-007',
-    name: 'Regex-based XSS sanitiser',
-    description:
-      'Java actions must not use blacklist regular expressions to strip HTML or script content.',
-    category: 'Security',
-    subcategory: 'Input Sanitization',
-    severity: 'High',
-    sourceSkill: 'java-actions.md',
-    sourceSection: 'Input Validation and Injection Prevention',
-    expectedPractice:
-      'Sanitise HTML with a parser-based sanitiser such as CommunityCommons.SanitizeHTML or the OWASP Java HTML Sanitizer.',
-    recommendation:
-      'Replace the regular-expression filtering with CommunityCommons.SanitizeHTML.',
-    whyItMatters:
-      'Blacklist regular expressions are bypassed by nested tags, SVG vectors and alternative encodings, so the sanitiser passes review while stored XSS still gets through.',
-    confidence: 'High',
-    requires: [],
-    check: (ir, emit) => {
-      for (const action of ir.customCode.javaActions) {
-        if (!action.hasRegexXssSanitizer) continue;
-        const inUserModule = isUserModule(ir, action.module);
-
-        emit({
-          key: `${action.module}.${action.name}`,
-          module: action.module,
-          // In a user module this is the team's own code and a defect they own. In a
-          // marketplace module they cannot edit the source, so it is reported as something to
-          // verify or replace rather than as their design violation — but it is still
-          // reported, because a sanitiser that does not work is a real exposure either way.
-          status: inUserModule ? 'FAIL' : 'WARNING',
-          severity: inUserModule ? 'High' : 'Medium',
-          confidence: inUserModule ? 'High' : 'Medium',
-          artifact: `Java action: ${action.module}.${action.name}`,
-          observation: inUserModule
-            ? `Java action "${action.name}" in module "${action.module}" filters HTML or script content with regular expressions.`
-            : `Java action "${action.name}" in marketplace module "${action.module}" filters HTML or script content with regular expressions. The source cannot be edited in place.`,
-          recommendation: inUserModule
-            ? `Refactor ${action.sourceFile ?? action.name} to use CommunityCommons.SanitizeHTML.`
-            : `Check for a newer version of "${action.module}", or route input through CommunityCommons.SanitizeHTML before it reaches this action.`,
-          objectName: action.name,
-          objectType: 'JavaAction',
-          artifactPath: action.sourceFile ?? `${action.module}.actions.${action.name}`,
-          details: {
-            module: action.module,
-            moduleIsMarketplace: !inUserModule,
-            sourceFile: action.sourceFile,
-            antiPattern: 'regular-expression HTML filtering',
-          },
-        });
-      }
-    },
-  }),
 
   defineRule({
     id: 'SEC-026',
@@ -1465,26 +1568,23 @@ const coreSecurityRules = [
 
   defineRule({
     id: 'SEC-028',
-    name: 'Reachable microflow bypasses entity access',
+    name: 'Microflow callable by a role runs without entity access',
     description:
-      'A microflow callable by a user role must apply entity access unless it is deliberately privileged.',
+      'A microflow that a user role may call, but that no page starts, runs with "Apply entity access" off. (Microflows started from a page are reported by SEC-MF-001 instead.)',
     category: 'Security',
     subcategory: 'Microflow Security',
     severity: 'High',
     sourceSkill: SECURITY_SKILL,
     sourceSection: 'Microflow Security',
     expectedPractice:
-      'Enable "Apply entity access" on microflows callable from the client, and keep privileged logic in microflows with no allowed roles.',
+      'A microflow with allowed roles applies entity access, so it reads and changes only what the calling user may. Logic that really needs full rights lives in a sub-microflow with no allowed roles, called after the caller has been checked.',
     recommendation:
-      'Enable "Apply entity access" on the microflow, or remove its allowed roles and call it from a microflow that does apply entity access.',
+      "Turn on \"Apply entity access\" in the microflow's properties. If it genuinely needs full rights, remove its allowed roles and call it from a microflow that checks the user first.",
     whyItMatters:
-      'With entity access off the microflow reads and writes with full rights regardless of who called it, so its retrieves ignore the access rules and XPath constraints that protect the same data everywhere else.',
+      'Allowed roles mean the browser can call the microflow directly, even if no page shows a button for it. With "Apply entity access" off it ignores the entity access rules and XPath constraints, so whatever it retrieves or changes, it does with full rights for anyone holding those roles.',
     // Medium: entity access off is sometimes deliberate for privileged logic. What raises it
     // above a style note is reachability — the rule only fires where a role can call it.
     confidence: 'Medium',
-    // `docs/security.md` §6.5 expected this to be NOT_ANALYZABLE in Phase 1. The microflow
-    // security facts turned out to be readable (`AllowedModuleRoles`, `ApplyEntityAccess`), so
-    // the rule runs. Only those two facts are used; nothing here needs the activity graph.
     requires: ['microflows', 'projectSecurity'],
     check: (ir, emit) => {
       const guestRoles = guestModuleRoles(ir);
@@ -1495,30 +1595,53 @@ const coreSecurityRules = [
         // context of whatever calls it. Flagging those would report the Mendix default on
         // every internal sub-microflow in the project.
         if (microflow.allowedRoles.length === 0) continue;
+        // Started from a page for a non-administrative role: SEC-MF-001 reports it, with the page.
+        if (isUserFacingWithoutEntityAccess(ir, microflow)) continue;
 
         const guestHeld = microflow.allowedRoles.filter((r) => guestRoles.has(r));
         const inUserModule = isUserModule(ir, microflow.module);
         if (guestHeld.length === 0 && !inUserModule) continue;
-
         const guestReachable = guestHeld.length > 0;
+
+        // Graded by what the microflow itself does with stored data. Unread contents keep the
+        // previous grading: Critical when an anonymous visitor can call it, High otherwise.
+        const data = dataAccess(ir, microflow);
+        const base: Record<DataAccess, RuleSeverity> = { writes: 'High', reads: 'Medium', calls: 'Low', none: 'Low' };
+        let severity: RuleSeverity = data ? base[data.level] : guestReachable ? 'Critical' : 'High';
+        if (data && guestReachable) severity = raise(severity);
+        if (!inUserModule) severity = lower(severity);
+        // Reads and writes are the defect; a flow with no data step of its own is a review item.
+        const certain = !data || data.level === 'writes' || data.level === 'reads';
+
+        const who = guestReachable
+          ? `the anonymous role (through ${guestHeld.join(', ')}), so anyone can call it without logging in`
+          : `role(s) ${microflow.allowedRoles.join(', ')}`;
+        const where = microflow.referencedBy === undefined ? '' : ' No page starts it, but the browser can still call it directly.';
+        const what = !data
+          ? ''
+          : data.level === 'writes'
+            ? ` It writes stored data (${stepList(data.steps)}) with full rights, so a caller can change records their own access rules would refuse.`
+            : data.level === 'reads'
+              ? ` It reads stored data (${stepList(data.steps)}) with full rights, so a caller can get records their own access rules would hide.`
+              : data.level === 'calls'
+                ? ` It does no data work itself but calls other microflows (${stepList(data.steps)}); check whether those read or write stored data.`
+                : ' It touches no stored data, so the setting has no effect today — but any data step added later will run with full rights.';
 
         emit({
           key: microflow.qualifiedName,
           module: microflow.module,
-          // The same split as SEC-007. In the team's own module this is their microflow and
-          // their defect. In a marketplace module they cannot change the flow, and the fix is
-          // to withdraw the grant that makes it reachable — so it is reported as something to
-          // act on via the role mapping rather than as a failure they caused.
-          severity: guestReachable && inUserModule ? 'Critical' : 'High',
-          status: inUserModule ? 'FAIL' : 'WARNING',
+          // The team's own module vs a Marketplace one: in a Marketplace module the flow cannot
+          // be changed in place, so the fix is to withdraw the grant that makes it reachable.
+          severity,
+          status: inUserModule && certain ? 'FAIL' : 'WARNING',
           confidence: inUserModule ? 'High' : 'Medium',
           artifact: `Microflow: ${microflow.qualifiedName}`,
-          observation: guestReachable
-            ? `Microflow "${microflow.qualifiedName}" does not apply entity access and is callable by guest-held module role(s) ${guestHeld.join(', ')}, so an unauthenticated visitor can run it with full data rights.${inUserModule ? '' : ` The microflow belongs to marketplace module "${microflow.module}" and cannot be changed in place.`}`
-            : `Microflow "${microflow.qualifiedName}" does not apply entity access and is callable by module role(s) ${microflow.allowedRoles.join(', ')}.`,
+          observation:
+            `Microflow "${microflow.qualifiedName}" runs with "Apply entity access" off and can be called by ${who}.${where}${what}` +
+            (inUserModule ? '' : ` The microflow belongs to Marketplace module "${microflow.module}" and cannot be changed in place.`),
           recommendation: inUserModule
-            ? 'Enable "Apply entity access" on the microflow, or remove its allowed roles and call it from a microflow that does apply entity access.'
-            : `Remove the guest-held role(s) ${guestHeld.join(', ')} from the guest user role so this microflow is no longer callable anonymously.`,
+            ? "Turn on \"Apply entity access\" in the microflow's properties. If it genuinely needs full rights, remove its allowed roles and call it from a microflow that checks the user first."
+            : `Remove ${guestHeld.join(', ')} from the anonymous user role so this microflow can no longer be called without logging in.`,
           objectName: microflow.name,
           objectType: 'Microflow',
           artifactPath: microflow.qualifiedName,
@@ -1526,6 +1649,8 @@ const coreSecurityRules = [
             appliesEntityAccess: false,
             allowedRoles: microflow.allowedRoles,
             guestHeldRoles: guestHeld,
+            dataAccess: data?.level ?? 'not read',
+            dataSteps: data?.steps.slice(0, 10) ?? [],
             moduleIsMarketplace: !inUserModule,
             unitPath: microflow.provenance?.unitPath,
           },

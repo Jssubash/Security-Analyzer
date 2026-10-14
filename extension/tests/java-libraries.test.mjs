@@ -104,7 +104,9 @@ describe('which jars are Marketplace and which are custom', () => {
 
   test('a library a Marketplace module declares, and what it pulls in, are Marketplace', () => {
     assert.equal(libs['guava-33.0.0-jre.jar'].origin, 'marketplace');
-    assert.deepEqual(libs['guava-33.0.0-jre.jar'].requiredBy, [{ module: 'CommunityCommons', moduleType: 'marketplace', direct: true, via: undefined }]);
+    assert.deepEqual(libs['guava-33.0.0-jre.jar'].requiredBy, [
+      { module: 'CommunityCommons', moduleType: 'marketplace', direct: true, via: undefined, settingsUnitId: undefined, declaredVersion: '33.0.0-jre', exclusions: [] },
+    ]);
     const transitive = libs['failureaccess-1.0.2.jar'];
     assert.equal(transitive.origin, 'marketplace');
     assert.equal(transitive.requiredBy[0].via, 'com.google.guava:guava');

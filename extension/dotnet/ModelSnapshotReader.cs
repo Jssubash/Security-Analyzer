@@ -11,7 +11,7 @@ namespace MendixGovernance.SecurityAnalyzer;
 ///
 /// The reader copies; it does not interpret. Every property is written under the name the
 /// model gives it, so the mapping from model to security facts lives in one place, the
-/// TypeScript extractor, where it is tested against the reference project. The only
+/// TypeScript extractor, where it is tested. The only
 /// transformation here is secret redaction.
 /// </summary>
 internal sealed class ModelSnapshotReader
@@ -51,6 +51,20 @@ internal sealed class ModelSnapshotReader
     };
 
     private const int MaxReferencesPerUnit = 5000;
+
+    /// <summary>Documents whose widgets are shown at runtime, scanned for the pluggable widgets they place.</summary>
+    private static readonly HashSet<string> WidgetUsageKinds = new(StringComparer.Ordinal)
+    {
+        "Page",
+        "Snippet",
+        "Layout",
+    };
+
+    /// <summary>
+    /// Each pluggable widget id placed in the app, with the pages, snippets and layouts that place
+    /// it — so the Upgrades tab can tell a vulnerable widget the app uses from one it only carries.
+    /// </summary>
+    private readonly SortedDictionary<string, SortedSet<string>> widgetUsage = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Project-level units.</summary>
     private static readonly string[] ProjectUnitTypes =
@@ -131,6 +145,7 @@ internal sealed class ModelSnapshotReader
                 ["name"] = project.Name,
                 ["directory"] = directory,
                 ["studioProVersion"] = StudioProVersion(),
+                ["javaVersion"] = JavaVersion(root),
             },
             ["projectUnits"] = projectUnits,
             ["modules"] = modules,
@@ -139,6 +154,8 @@ internal sealed class ModelSnapshotReader
             ["widgets"] = WidgetScanner.Read(directory, notes),
             ["acceptedRisks"] = AcceptedRiskStore.Read(directory),
             ["referenceIndex"] = referenceIndex,
+            ["widgetUsage"] = new JsonObject(widgetUsage.Select(kv => KeyValuePair.Create(
+                kv.Key, (JsonNode?)new JsonArray(kv.Value.Select(d => (JsonNode?)JsonValue.Create(d)).ToArray())))),
             ["notes"] = new JsonArray(notes.Select(n => (JsonNode?)JsonValue.Create(n)).ToArray()),
             ["diagnostics"] = new JsonObject
             {
@@ -165,6 +182,7 @@ internal sealed class ModelSnapshotReader
                 // conclusion covers the whole module, not just the documents the rules read.
                 var references = References(unit);
                 IndexReferences(unit, references, name);
+                if (WidgetUsageKinds.Contains(kind)) CollectWidgetUsage(unit, name);
                 if (!ModuleUnitKinds.Contains(kind)) continue;
                 var node = Serialize(unit, ShallowKinds.Contains(kind), depth: 0);
                 if (ReferenceKinds.Contains(kind)) node["$References"] = references.DeepClone();
@@ -275,8 +293,8 @@ internal sealed class ModelSnapshotReader
                 return null;
             case IModelStructure referenced when byName:
                 // A reference must reach the snapshot as the qualified name every rule compares
-                // against. Serialising the referenced element instead turns "Anonymous holds
-                // MyFirstModule.Anonymous" into a nested object no rule recognises, and every
+                // against. Serialising the referenced element instead turns "the guest role holds
+                // Module.Role" into a nested object no rule recognises, and every
                 // anonymous-access rule then passes for want of a role name.
                 unexpectedValues.TryAdd($"{Normalise(ownerType)}.{propertyName}", "reference element, read by qualified name");
                 return JsonValue.Create(referenced.QualifiedName ?? referenced.Name ?? "");
@@ -404,6 +422,43 @@ internal sealed class ModelSnapshotReader
         return new JsonArray(names.Select(n => (JsonNode?)JsonValue.Create(n)).ToArray());
     }
 
+    /// <summary>
+    /// Records the pluggable widgets a page, snippet or layout places: each <c>CustomWidget</c>
+    /// element's <c>type</c> carries the <c>widgetId</c> the widget package declares.
+    /// </summary>
+    private void CollectWidgetUsage(IModelUnit unit, string moduleName)
+    {
+        var document = unit.QualifiedName ?? (unit.Name is not null ? $"{moduleName}.{unit.Name}" : moduleName);
+        try
+        {
+            foreach (var element in unit.GetElements())
+            {
+                var type = Normalise(element.Type);
+                string? widgetId = null;
+                if (type.EndsWith("$CustomWidget", StringComparison.Ordinal))
+                {
+                    if (FirstValue(element, "type", "Type") is IModelStructure widgetType)
+                        widgetId = AsString(FirstValue(widgetType, "widgetId", "WidgetId"));
+                }
+                else if (type.EndsWith("$CustomWidgetType", StringComparison.Ordinal))
+                {
+                    widgetId = AsString(FirstValue(element, "widgetId", "WidgetId"));
+                }
+                if (string.IsNullOrWhiteSpace(widgetId)) continue;
+                if (!widgetUsage.TryGetValue(widgetId, out var documents))
+                {
+                    documents = new SortedSet<string>(StringComparer.Ordinal);
+                    widgetUsage[widgetId] = documents;
+                }
+                documents.Add(document);
+            }
+        }
+        catch (Exception ex)
+        {
+            notes.Add($"the widgets placed in {document} could not all be read: {ex.Message}");
+        }
+    }
+
     private void IndexReferences(IModelUnit unit, JsonArray references, string? moduleName)
     {
         var found = references
@@ -468,8 +523,9 @@ internal sealed class ModelSnapshotReader
     }
 
     /// <summary>
-    /// Java action sources under <c>javasource/&lt;module&gt;/actions</c>, for the regex-sanitiser
-    /// check (SEC-007). These are the app's own files on disk, read-only.
+    /// Java action sources under <c>javasource/&lt;module&gt;/actions</c>, so a microflow that Java
+    /// code calls by name (<c>Core.microflowCall("Module.Name")</c>) counts as used (SEC-MF-005).
+    /// These are the app's own files on disk, read-only.
     /// </summary>
     private JsonArray ReadJavaSources(string? directory)
     {
@@ -510,6 +566,29 @@ internal sealed class ModelSnapshotReader
             }
         }
         return files;
+    }
+
+    /// <summary>
+    /// The Java version the app runs on (<c>Java21</c>), from App Settings ▸ Runtime. The Java
+    /// libraries tab only suggests library releases compiled for this Java version or older.
+    /// </summary>
+    private string? JavaVersion(IModelRoot root)
+    {
+        try
+        {
+            foreach (var unit in UnitsOfType(root, "Settings$ProjectSettings"))
+            {
+                foreach (var element in unit.GetElements())
+                {
+                    if (FirstValue(element, "javaVersion", "JavaVersion") is { } value) return value.ToString();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            notes.Add($"the app's Java version could not be read: {ex.Message}");
+        }
+        return null;
     }
 
     private static string? StudioProVersion()

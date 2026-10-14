@@ -8,12 +8,14 @@
 
 import { analyzeSnapshot, entityForFinding, securityCatalogue, unitForFinding } from '../analyze.js';
 import type { RuleOutcome, SecurityAnalysisResult } from '../analyze.js';
-import { applyOsvResult, duplicateAdvice, gaOf, isCheckable, packagesToCheck, remediation } from '../java-libraries.js';
+import { applyOsvResult, compareVersions, duplicateAdvice, gaOf, isCheckable, packagesToCheck } from '../java-libraries.js';
+import { appJavaVersion, candidateVersions, chooseVersion, resolutionPlan, upgradeTargets } from '../version-advice.js';
+import type { CandidateFacts, UpgradeTarget, VersionAdvice } from '../version-advice.js';
 import type { DuplicateGroup, JavaLibrary, LibraryVulnerability, OsvCheckResult, VulnerabilityReport } from '../java-libraries.js';
-import { PLANNING_TARGETS, applyWidgetOsv, assessItem, assessWidget, contentIdsToCheck, isMendixVersion, matchWidgets, normaliseMendixVersion, widgetPackagesToCheck, widgetSecurityAdvice } from '../marketplace.js';
+import { applyWidgetOsv, assessItem, assessWidget, contentIdsToCheck, matchWidgets, widgetPackagesToCheck, widgetSecurityAdvice } from '../marketplace.js';
 import type { ItemAssessment, MarketplaceAnswer, MarketplaceItem, MarketplaceVersion, UpgradeStatus, WidgetVulnerabilityReport } from '../marketplace.js';
 import type { AccessState, ModuleStatus } from '../module-status.js';
-import { DEFAULT_REVIEW_DAYS, MAX_REVIEW_DAYS, MIN_REASON_LENGTH, addDays, riskKey, splitByAcceptance, today as todayIso, validateRisk } from '../accepted-risks.js';
+import { DEFAULT_REVIEW_DAYS, MAX_REVIEW_DAYS, MIN_REASON_LENGTH, acceptedByText, addDays, riskKey, splitByAcceptance, today as todayIso, validateRisk } from '../accepted-risks.js';
 import type { AcceptedRisk, AcceptedRisksFile, AcceptedVulnerability, RiskScope } from '../accepted-risks.js';
 import type { ModelSnapshot } from '../snapshot/types.js';
 import type { Finding, RuleSeverity } from '@mendix-analyzer/rule-engine';
@@ -28,7 +30,6 @@ type LibraryFilter = 'all' | 'marketplace' | 'custom' | 'vulnerable' | 'critical
 type ModuleSection = 'entities' | 'pages' | 'microflows' | 'nanoflows' | 'roles';
 
 const SEVERITIES: RuleSeverity[] = ['Critical', 'High', 'Medium', 'Low', 'Informational'];
-const ADVISORY_RULES = ['SEC-008', 'SEC-009'];
 
 const state = {
   phase: 'idle' as Phase,
@@ -37,10 +38,9 @@ const state = {
   result: undefined as SecurityAnalysisResult | undefined,
   tab: 'findings' as Tab,
   severities: new Set<RuleSeverity>(SEVERITIES),
-  showWarnings: true,
-  onlyOwnModules: false,
-  includeAdvisory: false,
   query: '',
+  /** Findings tab: show only this rule's findings; '' = every rule. */
+  ruleFilter: '',
   expanded: new Set<string>(),
   toast: '',
   /** Module status tab: open cards (by module) with their selected section, and whether Marketplace modules show. */
@@ -55,7 +55,6 @@ const state = {
   libFilter: 'all' as LibraryFilter,
   openLibraries: new Set<string>(),
   /** Upgrades tab: the Mendix version to plan for ('' = the app's), the Marketplace answer, the filters. */
-  upgradeTarget: '',
   marketplace: undefined as MarketplaceAnswer | undefined,
   widgetMatches: {} as Record<string, number>,
   catalogRead: false,
@@ -63,6 +62,8 @@ const state = {
   mpError: '',
   tokenSource: 'None' as 'None' | 'Typed' | 'Remembered' | 'Environment',
   upFilter: 'all' as UpgradeFilter,
+  /** Upgrades tab: open groups of widgets that ship inside a module, by module name. */
+  openBundles: new Set<string>(),
   /** The widget vulnerability check: the OSV.dev answer for the npm libraries bundled into widgets. */
   widgetOsv: undefined as OsvCheckResult | undefined,
   wvPhase: 'idle' as 'idle' | 'checking' | 'error',
@@ -74,6 +75,28 @@ const state = {
   riskForm: '',
   riskDraft: { reason: '', reviewBy: '' },
   riskError: '',
+  /**
+   * A check to run once the app has been re-read. The library and widget checks start with a fresh
+   * read so that jars or widgets added since the last run are included; otherwise "Check again"
+   * would only re-ask OSV.dev or the Marketplace about the files seen at the last full run.
+   */
+  afterRead: undefined as ((result: SecurityAnalysisResult) => void) | undefined,
+  /**
+   * Which tab's check started the current re-read. While set, progress is shown in that tab rather
+   * than in the header, because the user asked for a library or widget check, not a new analysis.
+   */
+  recheck: '' as '' | 'libraries' | 'upgrades',
+  /**
+   * The safe-version lookup that follows a library check: which release to move each vulnerable
+   * library to, chosen from Maven Central (see version-advice.ts). Keyed by library key.
+   */
+  advice: {
+    phase: 'idle' as 'idle' | 'versions' | 'inspecting' | 'done' | 'error',
+    error: '',
+    targets: [] as UpgradeTarget[],
+    candidates: {} as Record<string, { candidates: string[]; newerMajor?: string; error?: string }>,
+    byLibrary: {} as Record<string, VersionAdvice>,
+  },
 };
 
 /** Accepted and lapsed decisions per library or widget key, alongside the still-open advisories. */
@@ -88,6 +111,8 @@ const root = document.getElementById('app')!;
 
 function run(): void {
   if (state.phase === 'reading' || state.phase === 'analyzing') return;
+  state.afterRead = undefined;
+  state.recheck = '';
   if (inStudioPro) {
     state.phase = 'reading';
     state.error = '';
@@ -106,15 +131,22 @@ function analyze(snapshot: ModelSnapshot): void {
   // Let the "Analysing" state paint before the (synchronous) analysis runs.
   setTimeout(() => {
     try {
-      const enabledRules = Object.fromEntries(ADVISORY_RULES.map((id) => [id, state.includeAdvisory]));
-      state.result = analyzeSnapshot(snapshot, { enabledRules });
+      state.result = analyzeSnapshot(snapshot);
       state.phase = 'done';
-      state.expanded.clear();
+      // A tab's re-check keeps what the user had open; a new analysis starts collapsed.
+      if (!state.recheck) state.expanded.clear();
+      state.recheck = '';
+      const pending = state.afterRead;
+      state.afterRead = undefined;
+      // Runs after the render below, so the check's own "Checking…" state is what stays on screen.
+      if (pending) setTimeout(() => state.result && pending(state.result), 0);
       const failures = state.result.findings.filter((f) => f.status === 'FAIL').length;
       send('AnalysisComplete', { failures, findings: state.result.findings.length });
     } catch (err) {
       state.phase = 'error';
       state.error = `The analysis failed: ${(err as Error)?.message ?? String(err)}`;
+      state.afterRead = undefined;
+      state.recheck = '';
     }
     render();
   }, 30);
@@ -148,6 +180,22 @@ onHostMessage((msg) => {
       }
       break;
     case 'SnapshotFailed':
+      state.afterRead = undefined;
+      if (state.recheck && state.result) {
+        // The previous result is still valid; report the failed re-read where the check was asked for.
+        const message = `The app could not be re-read, so the check did not run: ${msg.data.error}`;
+        if (state.recheck === 'libraries') {
+          state.vulnPhase = 'error';
+          state.vulnError = message;
+        } else {
+          state.wvPhase = 'error';
+          state.wvError = message;
+        }
+        state.recheck = '';
+        state.phase = 'done';
+        render();
+        break;
+      }
       state.phase = 'error';
       state.error = msg.data.error;
       render();
@@ -161,6 +209,7 @@ onHostMessage((msg) => {
         try {
           state.osv = JSON.parse(msg.data.json) as OsvCheckResult;
           state.vulnPhase = 'idle';
+          if (state.result) startVersionAdvice(state.result);
         } catch (err) {
           state.vulnPhase = 'error';
           state.vulnError = `The answer from OSV.dev could not be read: ${(err as Error).message}`;
@@ -170,6 +219,9 @@ onHostMessage((msg) => {
         state.vulnError = msg.data.error ?? 'The vulnerability check failed.';
       }
       render();
+      break;
+    case 'VersionAdviceResult':
+      onVersionAdvice(msg.data);
       break;
     case 'AcceptedRisks':
       if (msg.data.ok && msg.data.json) {
@@ -196,7 +248,11 @@ onHostMessage((msg) => {
       showToast(msg.data.error ? `Export failed: ${msg.data.error}` : `Saved to ${msg.data.path}`);
       break;
     case 'OpenUnitResult': {
-      if (msg.data.ok) break;
+      if (msg.data.ok) {
+        // Opened, with a note — e.g. the activity changed since the analysis, so only the microflow opened.
+        if (msg.data.error) showToast(msg.data.error);
+        break;
+      }
       const { name, error } = msg.data;
       if (!name) {
         showToast(error ?? 'Studio Pro could not open that document.');
@@ -239,8 +295,13 @@ function exportReport(kind: 'html' | 'json'): void {
 }
 
 /** Open a document; with `entity`, the domain model opens with that entity selected. */
-function openInStudioPro(unitId: string, entity?: string): void {
-  send('OpenUnit', entity ? { unitId, entity } : { unitId });
+/** Whether `candidate` is a later version than `current` (an unknown current version counts as older). */
+function isNewer(candidate: string, current: string | undefined): boolean {
+  return !current || compareVersions(candidate, current) > 0;
+}
+
+function openInStudioPro(unitId: string, entity?: string, activity?: string): void {
+  send('OpenUnit', { unitId, ...(entity ? { entity } : {}), ...(activity ? { activity } : {}) });
 }
 
 let toastTimer: number | undefined;
@@ -270,7 +331,9 @@ function renderToast(): void {
 }
 
 function header(): HTMLElement {
-  const busy = state.phase === 'reading' || state.phase === 'analyzing';
+  const working = state.phase === 'reading' || state.phase === 'analyzing';
+  // A tab's re-check shows its progress in that tab; the header only reflects a full analysis.
+  const busy = working && !state.recheck;
   const result = state.result;
   return h(
     'header',
@@ -305,7 +368,7 @@ function header(): HTMLElement {
         : null,
       h(
         'button',
-        { class: 'btn primary', onclick: run, disabled: busy },
+        { class: 'btn primary', onclick: run, disabled: working },
         busy ? spinner() : playIcon(),
         busy ? (state.phase === 'reading' ? 'Reading model…' : 'Analysing…') : result ? 'Run again' : 'Run analysis'
       )
@@ -448,18 +511,47 @@ function visibleFindings(result: SecurityAnalysisResult): Finding[] {
   const q = state.query.trim().toLowerCase();
   return result.findings.filter((f) => {
     if (!state.severities.has(f.severity)) return false;
-    if (!state.showWarnings && f.status === 'WARNING') return false;
-    if (state.onlyOwnModules && f.module && result.moduleTypes[f.module] !== 'user') return false;
+    if (state.ruleFilter && f.ruleId !== state.ruleFilter) return false;
     if (!q) return true;
     return [f.ruleId, f.ruleTitle, f.artifact, f.observation, f.module ?? ''].some((s) => s.toLowerCase().includes(q));
   });
 }
 
+/**
+ * The Rule filter: every rule that has findings in this run, grouped by area like the Rules tab,
+ * with its finding count. A rule chosen before a re-run that no longer has findings is dropped.
+ */
+function ruleFilterSelect(result: SecurityAnalysisResult, onChange: () => void): HTMLSelectElement {
+  const withFindings = result.rules.filter((r) => r.findingCount > 0);
+  if (state.ruleFilter && !withFindings.some((r) => r.id === state.ruleFilter)) state.ruleFilter = '';
+  const groups = new Map<string, RuleOutcome[]>();
+  for (const r of withFindings) groups.set(r.subcategory, [...(groups.get(r.subcategory) ?? []), r]);
+  const select = h(
+    'select',
+    { class: 'rule-filter', 'aria-label': 'Show findings of one rule', title: 'Show findings of one rule' },
+    h('option', { value: '' }, `All rules (${withFindings.length})`),
+    [...groups].map(([group, rules]) =>
+      h('optgroup', { label: group }, rules.map((r) => h('option', { value: r.id }, `${r.id} · ${r.name} (${r.findingCount})`)))
+    )
+  ) as HTMLSelectElement;
+  select.value = state.ruleFilter;
+  select.addEventListener('change', () => {
+    state.ruleFilter = select.value;
+    onChange();
+  });
+  return select;
+}
+
 function findingsView(result: SecurityAnalysisResult): HTMLElement {
   const list = h('div', { class: 'finding-list' });
+  const summary = h('p', { class: 'muted small filter-summary', 'aria-live': 'polite' });
   const renderList = () => {
     clear(list);
     const visible = visibleFindings(result);
+    summary.textContent =
+      result.findings.length === 0 ? '' : visible.length === result.findings.length
+        ? `Showing all ${result.findings.length} findings`
+        : `Showing ${visible.length} of ${result.findings.length} findings`;
     if (result.findings.length === 0) {
       append(list, [h('div', { class: 'all-clear' }, checkIcon(), h('div', {}, h('strong', {}, 'No security findings.'), ' Every rule that could run passed.'))]);
       return;
@@ -483,23 +575,7 @@ function findingsView(result: SecurityAnalysisResult): HTMLElement {
     renderList();
   });
 
-  const toggle = (label: string, checked: boolean, onChange: (v: boolean) => void, title?: string) => {
-    const box = h('input', { type: 'checkbox', checked });
-    box.addEventListener('change', () => onChange(box.checked));
-    return h('label', { class: 'toggle', title }, box, label);
-  };
-
-  const toolbar = h(
-    'div',
-    { class: 'toolbar' },
-    search,
-    toggle('Warnings', state.showWarnings, (v) => { state.showWarnings = v; renderList(); }, 'Include findings that need review rather than a fix'),
-    toggle('Only my modules', state.onlyOwnModules, (v) => { state.onlyOwnModules = v; renderList(); }, 'Hide findings in Marketplace modules'),
-    toggle('Advisory checks', state.includeAdvisory, (v) => {
-      state.includeAdvisory = v;
-      if (state.snapshot) analyze(state.snapshot);
-    }, 'Also run SEC-008 (PII encryption) and SEC-009 (rate limiting), which are off by default')
-  );
+  const toolbar = h('div', { class: 'toolbar' }, search, ruleFilterSelect(result, renderList));
 
   renderList();
   return h(
@@ -509,6 +585,7 @@ function findingsView(result: SecurityAnalysisResult): HTMLElement {
       'Security problems found in the app. Each finding names the rule it breaks and what was found; open it for why it matters, how to fix it, the evidence, and a button to open the document in Studio Pro. “Review” marks findings that need a person’s judgement or sit in a Marketplace module (shown one severity lower). Click a severity tile above to filter.'
     ),
     toolbar,
+    summary,
     list
   );
 }
@@ -556,11 +633,10 @@ function findingCard(f: Finding, result: SecurityAnalysisResult): HTMLElement {
           detail('Why it matters', f.whyItMatters),
           detail('Recommendation', f.recommendation),
           detail('Expected practice', f.expectedPractice),
-          evidence(f),
+          evidence(f, unitId),
           h(
             'div',
             { class: 'detail-foot' },
-            h('span', { class: 'muted' }, `Confidence: ${f.confidence} · Source: ${f.sourceSkill}${f.sourceSection ? ` › ${f.sourceSection}` : ''}`),
             unitId && inStudioPro
               ? h('button', { class: 'btn small', onclick: () => openInStudioPro(unitId, entityForFinding(f, result.entityNames)) }, 'Open in Studio Pro')
               : null
@@ -575,7 +651,7 @@ function detail(label: string, text: string): HTMLElement {
   return h('div', { class: 'detail' }, h('div', { class: 'label' }, label), h('div', {}, text));
 }
 
-function evidence(f: Finding): HTMLElement | null {
+function evidence(f: Finding, unitId: string | undefined): HTMLElement | null {
   const entries = Object.entries(f.evidence.details ?? {}).filter(
     ([k, v]) => v !== undefined && v !== null && k !== 'unitPath' && !(Array.isArray(v) && v.length === 0)
   );
@@ -589,24 +665,58 @@ function evidence(f: Finding): HTMLElement | null {
       { class: 'evidence' },
       h('dt', {}, 'artifact'),
       h('dd', {}, f.evidence.artifactPath),
-      entries.flatMap(([k, v]) => [h('dt', {}, humanise(k)), h('dd', {}, formatValue(v))])
+      entries.flatMap(([k, v]) => [h('dt', {}, humanise(k)), h('dd', {}, evidenceValue(v, unitId))])
     )
   );
+}
+
+/**
+ * Evidence laid out for reading: a list puts each item on its own line, and an item with fields
+ * (activity, member, expression, problem …) shows each field on its own labelled line.
+ */
+function evidenceValue(value: unknown, unitId?: string): HTMLElement | string {
+  if (Array.isArray(value)) {
+    if (value.length === 1) return evidenceValue(value[0], unitId);
+    return h('ol', { class: 'evidence-list' }, value.map((item) => h('li', {}, evidenceValue(item, unitId))));
+  }
+  if (value && typeof value === 'object') {
+    const fields = value as Record<string, unknown>;
+    // An item naming a microflow activity gets a button that opens the microflow with it selected.
+    const activityId = typeof fields.activityId === 'string' ? fields.activityId : undefined;
+    const showActivity =
+      activityId && unitId && inStudioPro
+        ? h(
+            'button',
+            {
+              class: 'btn small evidence-open',
+              title: 'Open the microflow in Studio Pro with this activity selected',
+              onclick: () => openInStudioPro(unitId, undefined, activityId),
+            },
+            'Show activity'
+          )
+        : null;
+    return h(
+      'div',
+      { class: 'evidence-item' },
+      Object.entries(fields)
+        .filter(([k, v]) => k !== 'activityId' && v !== undefined && v !== null && v !== '')
+        .map(([k, v]) =>
+          h(
+            'div',
+            { class: 'evidence-field' },
+            h('span', { class: 'evidence-key' }, humanise(k)),
+            k === 'member' && showActivity ? h('span', { class: 'evidence-with-action' }, h('span', {}, evidenceValue(v, unitId)), showActivity) : h('span', {}, evidenceValue(v, unitId))
+          )
+        )
+    );
+  }
+  return String(value);
 }
 
 function humanise(key: string): string {
   return key.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase();
 }
 
-function formatValue(value: unknown): string {
-  if (Array.isArray(value)) return value.map(formatValue).join(', ');
-  if (value && typeof value === 'object') {
-    return Object.entries(value as Record<string, unknown>)
-      .map(([k, v]) => `${humanise(k)}: ${formatValue(v)}`)
-      .join('; ');
-  }
-  return String(value);
-}
 
 // ---------------------------------------------------------------------- rules
 
@@ -630,7 +740,7 @@ function rulesView(result: SecurityAnalysisResult): HTMLElement {
     'section',
     { class: 'panel' },
     tabIntro(
-      'Every security rule the analyzer checks, grouped by area, with its result for this app. Click a rule to see exactly what it checks, when it reports and what it leaves alone. Results: Passed, Failed, Review (needs judgement), Not applicable (the app has nothing to check, with the reason), Not verified (a setting the rule needs could not be read from this app, so it is not counted as a pass) or Off (advisory rules, enabled from the Findings tab).'
+      'Every security rule the analyzer checks, grouped by area, with its result for this app. Click a rule to see exactly what it checks, when it reports and what it leaves alone. Results: Passed, Failed, Review (needs judgement), Not applicable (the app has nothing to check, with the reason), Not verified (a setting the rule needs could not be read from this app, so it is not counted as a pass) or Off (advisory rules, not run).'
     ),
     [...groups].map(([group, rules]) =>
       h(
@@ -690,7 +800,29 @@ function ruleDetails(r: RuleOutcome): HTMLElement {
     c && c.flagged.length > 0 ? h('div', { class: 'detail' }, h('div', { class: 'label' }, 'Reported when'), list(c.flagged)) : null,
     c && c.notFlagged.length > 0 ? h('div', { class: 'detail' }, h('div', { class: 'label' }, 'Not reported'), list(c.notFlagged)) : null,
     detail('Why it matters', r.whyItMatters),
-    detail('How to fix', r.recommendation)
+    detail('How to fix', r.recommendation),
+    r.findingCount > 0
+      ? h(
+          'div',
+          { class: 'detail-foot' },
+          h('span', {}),
+          h(
+            'button',
+            {
+              class: 'btn small',
+              onclick: () => {
+                // Open the Findings tab on this rule alone, clearing filters that could hide its findings.
+                state.ruleFilter = r.id;
+                state.query = '';
+                state.severities = new Set(SEVERITIES);
+                state.tab = 'findings';
+                render();
+              },
+            },
+            `Show ${r.findingCount} finding${r.findingCount === 1 ? '' : 's'}`
+          )
+        )
+      : null
   );
 }
 
@@ -1051,6 +1183,47 @@ function libraryTabCount(result: SecurityAnalysisResult): number | undefined {
   return result.javaLibraries.libraries.length || undefined;
 }
 
+/**
+ * A horizontal progress bar with what the check is doing right now, shown inside the tab whose check
+ * is running. In Studio Pro a check is two steps (re-read the app, then ask the service); in the
+ * browser stand-in there is nothing to re-read, so it is one.
+ */
+function taskProgress(step: number, message: string, total = 2): HTMLElement {
+  // Outside Studio Pro there is no re-read, so the steps after it are numbered one lower.
+  const steps = inStudioPro ? total : total - 1;
+  const label = steps > 1 ? `Step ${inStudioPro ? step : step - 1} of ${steps} · ${message}` : message;
+  return h(
+    'div',
+    { class: 'task-progress', role: 'status', 'aria-live': 'polite' },
+    h('div', { class: 'progress', role: 'progressbar', 'aria-label': message }, h('div', { class: 'bar' })),
+    h('span', { class: 'small' }, label)
+  );
+}
+
+/**
+ * Re-read the app (so files added since the last run are seen), then run `check` on the new result.
+ * Outside Studio Pro there is nothing to re-read, so the check runs on what is loaded.
+ */
+function rereadThen(
+  tab: 'libraries' | 'upgrades',
+  check: (result: SecurityAnalysisResult) => void,
+  current: SecurityAnalysisResult
+): void {
+  if (!inStudioPro) {
+    check(current);
+    return;
+  }
+  if (state.phase === 'reading' || state.phase === 'analyzing') return;
+  state.afterRead = check;
+  state.recheck = tab;
+  if (tab === 'libraries') state.vulnPhase = 'idle';
+  else state.wvPhase = state.wvPhase === 'error' ? 'idle' : state.wvPhase;
+  state.phase = 'reading';
+  state.error = '';
+  render();
+  send('RunAnalysis');
+}
+
 function checkVulnerabilities(result: SecurityAnalysisResult): void {
   const packages = packagesToCheck(result.javaLibraries);
   if (packages.length === 0) {
@@ -1063,8 +1236,91 @@ function checkVulnerabilities(result: SecurityAnalysisResult): void {
   }
   state.vulnPhase = 'checking';
   state.vulnError = '';
+  state.advice = { phase: 'idle', error: '', targets: [], candidates: {}, byLibrary: {} };
   render();
   send('CheckVulnerabilities', { packages });
+}
+
+// ---------------------------------------------------------------------- safe versions
+
+/**
+ * Step 3 of the library check: for every library with open advisories, find the release to move
+ * to. Two calls to the host — the release lists, then the few candidate jars — and the choice is
+ * made here by version-advice.ts. A failure leaves the advisories' minimum in the steps.
+ */
+function startVersionAdvice(result: SecurityAnalysisResult): void {
+  const report = vulnerabilityReport(result);
+  const targets = report ? upgradeTargets(result.javaLibraries.libraries, report) : [];
+  state.advice = { phase: 'idle', error: '', targets, candidates: {}, byLibrary: {} };
+  if (targets.length === 0 || !inStudioPro) return;
+  state.advice.phase = 'versions';
+  send('MavenVersions', { libraries: [...new Set(targets.map((t) => `${t.group}:${t.artifact}`))] });
+}
+
+function onVersionAdvice(data: { ok: boolean; stage: 'versions' | 'inspect'; json?: string; error?: string }): void {
+  const advice = state.advice;
+  const result = state.result;
+  if (!result || advice.phase === 'idle' || advice.phase === 'done') return;
+  if (!data.ok || !data.json) {
+    advice.phase = 'error';
+    advice.error = data.error ?? 'Maven Central could not be checked.';
+    render();
+    return;
+  }
+  try {
+    if (data.stage === 'versions') {
+      const lists = JSON.parse(data.json) as Record<string, string[] | { error: string }>;
+      const wanted: { group: string; artifact: string; version: string }[] = [];
+      for (const t of advice.targets) {
+        const list = lists[`${t.group}:${t.artifact}`];
+        if (!list || !Array.isArray(list)) {
+          advice.candidates[t.libKey] = { candidates: [], error: list && !Array.isArray(list) ? list.error : 'no release list was returned' };
+          continue;
+        }
+        const picked = candidateVersions(t, list);
+        advice.candidates[t.libKey] = picked;
+        for (const version of picked.candidates) wanted.push({ group: t.group, artifact: t.artifact, version });
+      }
+      if (wanted.length === 0) {
+        finishVersionAdvice(result, { jars: {}, osv: {} });
+        return;
+      }
+      advice.phase = 'inspecting';
+      render();
+      send('InspectCandidates', { candidates: wanted });
+      return;
+    }
+    finishVersionAdvice(result, JSON.parse(data.json) as { jars: Record<string, CandidateFacts['jars'][string]>; osv: Record<string, string[]> });
+  } catch (err) {
+    advice.phase = 'error';
+    advice.error = `The answer from Maven Central could not be read: ${(err as Error).message}`;
+    render();
+  }
+}
+
+function finishVersionAdvice(
+  result: SecurityAnalysisResult,
+  answer: { jars: Record<string, CandidateFacts['jars'][string]>; osv: Record<string, string[]> }
+): void {
+  const advice = state.advice;
+  const java = appJavaVersion(result.app.javaVersion, result.upgrades.mendixVersion ?? result.app.studioProVersion);
+  for (const t of advice.targets) {
+    const picked = advice.candidates[t.libKey];
+    if (!picked) continue;
+    if (picked.error) {
+      advice.byLibrary[t.libKey] = { minimum: t.minimum, rejected: [], note: `Maven Central's release list could not be read: ${picked.error}.` };
+      continue;
+    }
+    const facts: CandidateFacts = { osv: {}, jars: {} };
+    for (const version of picked.candidates) {
+      const key = `${t.group}:${t.artifact}@${version}`;
+      if (answer.osv[key]) facts.osv[version] = answer.osv[key]!;
+      if (answer.jars[key]) facts.jars[version] = answer.jars[key]!;
+    }
+    advice.byLibrary[t.libKey] = chooseVersion(t, picked.candidates, facts, java, picked.newerMajor);
+  }
+  advice.phase = 'done';
+  render();
 }
 
 function librariesView(result: SecurityAnalysisResult): HTMLElement {
@@ -1135,6 +1391,9 @@ function librariesView(result: SecurityAnalysisResult): HTMLElement {
   if (!report && (state.libFilter === 'vulnerable' || state.libFilter === 'critical-high' || state.libFilter === 'accepted')) state.libFilter = 'all';
 
   const checking = state.vulnPhase === 'checking';
+  const reading = state.recheck === 'libraries';
+  const suggesting = state.advice.phase === 'versions' || state.advice.phase === 'inspecting';
+  const busy = checking || reading || suggesting;
   const packages = packagesToCheck(inventory).length;
   const checkBar = h(
     'div',
@@ -1145,8 +1404,8 @@ function librariesView(result: SecurityAnalysisResult): HTMLElement {
       h(
         'strong',
         {},
-        checking
-          ? 'Checking OSV.dev…'
+        busy
+          ? 'Checking the Java libraries…'
           : report
             ? vulnerable.length === 0
               ? 'No known vulnerabilities'
@@ -1165,10 +1424,26 @@ function librariesView(result: SecurityAnalysisResult): HTMLElement {
     ),
     h(
       'button',
-      { class: 'btn primary', onclick: () => checkVulnerabilities(result), disabled: checking || packages === 0 },
-      checking ? spinner() : shieldIcon(),
-      checking ? 'Checking…' : report ? 'Check again' : 'Check for vulnerabilities'
-    )
+      {
+        class: 'btn primary',
+        title: 'Re-reads userlib and vendorlib, then checks every library against OSV.dev',
+        onclick: () => rereadThen('libraries', checkVulnerabilities, result),
+        disabled: busy || packages === 0,
+      },
+      busy ? spinner() : shieldIcon(),
+      reading ? 'Reading…' : checking || suggesting ? 'Checking…' : report ? 'Check again' : 'Check for vulnerabilities'
+    ),
+    reading
+      ? taskProgress(1, 'Reading the jars in userlib and vendorlib…', 3)
+      : checking
+        ? taskProgress(2, `Checking ${packages} librar${packages === 1 ? 'y' : 'ies'} against OSV.dev…`, 3)
+        : suggesting
+          ? taskProgress(
+              3,
+              `Finding a safe version on Maven Central for ${state.advice.targets.length} vulnerable librar${state.advice.targets.length === 1 ? 'y' : 'ies'}${state.advice.phase === 'inspecting' ? ' (checking candidate releases)' : ''}…`,
+              3
+            )
+          : null
   );
 
   const card = (filter: LibraryFilter, label: string, value: string | number, cls = '', needsCheck = false) => {
@@ -1443,6 +1718,7 @@ function libraryDetail(lib: JavaLibrary, status: LibraryStatus): HTMLElement {
         : status.kind === 'clean'
           ? detail('Vulnerabilities', 'OSV.dev lists no advisory for this version.')
           : null,
+    status.kind === 'vulnerable' ? howToResolve(lib, status.vulns) : null,
     status.kind === 'accepted' || status.kind === 'vulnerable' ? acceptedSection('library', lib.key, status.accepted) : null,
     lib.duplicateOf
       ? detail(
@@ -1465,6 +1741,79 @@ function libraryDetail(lib: JavaLibrary, status: LibraryStatus): HTMLElement {
       lib.nestedJars ? [h('dt', {}, 'nested jars'), h('dd', {}, `${lib.nestedJars} jar(s) packed inside, not inspected`)] : null
     ),
     inStudioPro ? h('div', { class: 'detail-foot' }, h('span', { class: 'muted small' }, `${lib.folder}\\${lib.fileName}`), openFolderButton(lib)) : null
+  );
+}
+
+/**
+ * The version to move to and the steps to get there, for one vulnerable library. The version comes
+ * from the safe-version lookup when it has finished, otherwise from the advisories' minimum.
+ */
+function howToResolve(lib: JavaLibrary, vulns: LibraryVulnerability[]): HTMLElement {
+  const advice = state.advice.byLibrary[lib.key];
+  const lookingUp = state.advice.phase === 'versions' || state.advice.phase === 'inspecting';
+  const ownFixes = vulns.filter((v) => !v.bundled && v.fixedIn).map((v) => v.fixedIn!);
+  const minimum = ownFixes.sort((a, b) => compareVersions(b, a))[0];
+  const plan = resolutionPlan(lib, vulns, advice, minimum);
+  const java = state.result ? appJavaVersion(state.result.app.javaVersion, state.result.upgrades.mendixVersion ?? state.result.app.studioProVersion) : undefined;
+  const name = lib.coordinates?.artifact ?? lib.fileName;
+
+  const versionLine = (): HTMLElement | null => {
+    if (advice?.suggested) {
+      return h(
+        'p',
+        { class: 'resolve-version' },
+        'Use ',
+        h('strong', {}, `${name} ${advice.suggested}`),
+        ` — the newest ${name} release in the same major version that fixes ${vulns.length === 1 ? 'this advisory' : `all ${vulns.length} advisories`} here, has no known advisories of its own`,
+        advice.suggestedJava !== undefined ? `, and is compiled for Java ${advice.suggestedJava}${java !== undefined ? ` (this app runs Java ${java})` : ''}` : '',
+        '.',
+        advice.minimum && advice.minimum !== advice.suggested ? ` Minimum fix: ${advice.minimum}.` : ''
+      );
+    }
+    if (lookingUp) return h('p', { class: 'muted small' }, spinner(), ' Finding a safe version on Maven Central…');
+    const why = advice?.note ?? (state.advice.phase === 'error' ? state.advice.error : undefined);
+    if (!plan.versionText) return null;
+    return h('p', { class: 'resolve-version' }, 'Use ', h('strong', {}, `${name} ${plan.versionText}`), '.', why ? h('span', { class: 'muted small' }, ` ${why}`) : null);
+  };
+
+  return h(
+    'div',
+    { class: 'detail resolve' },
+    h('div', { class: 'label' }, 'How to resolve'),
+    versionLine(),
+    advice?.newerMajor
+      ? h('p', { class: 'muted small' }, `${name} ${advice.newerMajor} (a newer major version) exists but is not suggested: a major version can change the library's API and break the module's code.`)
+      : null,
+    plan.steps.length > 0 ? h('ol', { class: 'resolve-steps' }, plan.steps.map((s) => h('li', {}, s))) : null,
+    plan.notes.map((n) => h('p', { class: 'muted small' }, n)),
+    advice && advice.rejected.length > 0
+      ? h(
+          'details',
+          { class: 'resolve-rejected' },
+          h('summary', { class: 'muted small' }, `Releases passed over (${advice.rejected.length})`),
+          h('ul', { class: 'small' }, advice.rejected.map((r) => h('li', {}, `${name} ${r.version} ${r.reason}`)))
+        )
+      : null,
+    inStudioPro && (plan.openSettings.length > 0 || plan.maven)
+      ? h(
+          'div',
+          { class: 'resolve-actions' },
+          plan.openSettings.map((o) =>
+            h(
+              'button',
+              { class: 'btn small primary', title: `Opens ${o.module}'s module settings, with its Java Dependencies`, onclick: () => openInStudioPro(o.unitId) },
+              `Open ${o.module} settings in Studio Pro`
+            )
+          ),
+          plan.maven
+            ? h(
+                'button',
+                { class: 'btn small', onclick: () => send('OpenMavenCentral', { ...plan.maven }) },
+                plan.maven.version ? `Open ${name} ${plan.maven.version} on Maven Central` : `Open ${name} on Maven Central`
+              )
+            : null
+        )
+      : null
   );
 }
 
@@ -1491,7 +1840,6 @@ function vulnerabilityRow(lib: JavaLibrary, v: LibraryVulnerability, overdue?: A
       v.published ? ` · published ${new Date(v.published).toLocaleDateString()}` : '',
       v.cwes.length > 0 ? ` · ${v.cwes.join(', ')}` : ''
     ),
-    h('div', { class: 'vuln-fix' }, h('strong', {}, 'Fix: '), remediation(lib, v)),
     riskControls('library', lib.key, v, overdue)
   );
 }
@@ -1581,9 +1929,9 @@ function onWidgetVulnerabilityResult(data: { ok: boolean; json?: string; error?:
 /** The token typed for the check in progress; kept only until the host has answered. */
 let pendingToken = '';
 
+/** Versions are always judged against the Mendix version of the app the extension is running in. */
 function upgradeTarget(result: SecurityAnalysisResult): string | undefined {
-  const typed = state.upgradeTarget.trim();
-  return typed && isMendixVersion(typed) ? normaliseMendixVersion(typed) : result.upgrades.mendixVersion;
+  return result.upgrades.mendixVersion;
 }
 
 function upgradeAssessments(result: SecurityAnalysisResult): Map<string, ItemAssessment> {
@@ -1695,22 +2043,7 @@ function upgradesView(result: SecurityAnalysisResult): HTMLElement {
     }
   };
 
-  // ---- planner and connection
-  const targetInput = h('input', {
-    type: 'text',
-    class: 'search version-input',
-    value: state.upgradeTarget,
-    placeholder: inventory.mendixVersion ?? 'e.g. 10.24.0',
-    list: 'mendix-versions',
-    'aria-label': 'Mendix version to plan for',
-  });
-  targetInput.addEventListener('change', () => {
-    state.upgradeTarget = targetInput.value;
-    render();
-  });
-  const versions = h('datalist', { id: 'mendix-versions' }, PLANNING_TARGETS.map((v) => h('option', { value: v })));
-  const badTarget = state.upgradeTarget.trim() !== '' && !isMendixVersion(state.upgradeTarget);
-
+  // ---- connection
   const tokenInput = h('input', { type: 'password', class: 'search', placeholder: 'Mendix Personal Access Token', autocomplete: 'off', 'aria-label': 'Mendix Personal Access Token' });
   const rememberBox = h('input', { type: 'checkbox' });
   const checking = state.mpPhase === 'checking';
@@ -1719,7 +2052,19 @@ function upgradesView(result: SecurityAnalysisResult): HTMLElement {
   // One bar, one button: the Marketplace compatibility check and the widget vulnerability check
   // run together. The vulnerability check needs no token, so it runs even when there is none.
   const wvChecking = state.wvPhase === 'checking';
-  const anyChecking = checking || wvChecking;
+  const rereading = state.recheck === 'upgrades';
+  const anyChecking = checking || wvChecking || rereading;
+  const widgetCount = inventory.widgets.length;
+  // What is running right now, for the progress line: both checks can run at once.
+  const running = [
+    checking ? `checking ${inventory.modules.length + inventory.widgets.length} modules and widgets against the Marketplace` : '',
+    wvChecking ? `checking the libraries bundled into ${widgetCount} widget${widgetCount === 1 ? '' : 's'} against OSV.dev` : '',
+  ].filter(Boolean);
+  const progress = rereading
+    ? taskProgress(1, 'Reading the Marketplace modules and the widgets folder…')
+    : running.length > 0
+      ? taskProgress(2, `${running.join(', and ').replace(/^./, (c) => c.toUpperCase())}…`)
+      : null;
   const vulnerableCount = inventory.widgets.filter((w) => (wv?.byWidget[w.key]?.length ?? 0) > 0).length;
   const advisoryCount = new Set(inventory.widgets.flatMap((w) => (wv?.byWidget[w.key] ?? []).map((v) => v.id))).size;
   const tokenText = hasToken
@@ -1781,18 +2126,24 @@ function upgradesView(result: SecurityAnalysisResult): HTMLElement {
       {
         class: 'btn primary',
         disabled: anyChecking || items.length === 0,
+        title: 'Re-reads the modules and the widgets folder, then runs the checks',
         onclick: () => {
           const typed = tokenInput.value;
-          // Compatibility runs when a token is available or typed; the vulnerability check always runs.
-          if (hasToken || typed.trim()) checkMarketplace(result, typed, rememberBox.checked);
-          if (widgetPackagesToCheck(inventory).length > 0) checkWidgetVulnerabilities(result);
-          if (!hasToken && !typed.trim()) showToast('Checking widget vulnerabilities only: enter a Mendix Personal Access Token to include version compatibility.');
+          const remember = rememberBox.checked;
           tokenInput.value = '';
+          // Re-read first so widgets and modules added since the last run are checked too.
+          rereadThen('upgrades', (fresh) => {
+            // Compatibility runs when a token is available or typed; the vulnerability check always runs.
+            if (hasToken || typed.trim()) checkMarketplace(fresh, typed, remember);
+            if (widgetPackagesToCheck(fresh.upgrades).length > 0) checkWidgetVulnerabilities(fresh);
+            if (!hasToken && !typed.trim()) showToast('Checking widget vulnerabilities only: enter a Mendix Personal Access Token to include version compatibility.');
+          }, result);
         },
       },
       anyChecking ? spinner() : shieldIcon(),
-      anyChecking ? 'Checking…' : checked || wv ? 'Check again' : 'Run checks'
-    )
+      rereading ? 'Reading…' : anyChecking ? 'Checking…' : checked || wv ? 'Check again' : 'Run checks'
+    ),
+    progress
   );
 
   const planner = h(
@@ -1802,14 +2153,12 @@ function upgradesView(result: SecurityAnalysisResult): HTMLElement {
     h(
       'div',
       { class: 'planner-target' },
-      h('label', { class: 'label' }, 'Plan for Mendix version'),
-      h('div', { class: 'planner-row' }, targetInput, versions, state.upgradeTarget ? h('button', { class: 'btn ghost small', onclick: () => { state.upgradeTarget = ''; render(); } }, 'Use the app’s version') : null),
       h(
         'span',
-        { class: badTarget ? 'error-text small' : 'muted small' },
-        badTarget
-          ? 'Enter a version such as 10.24.0.'
-          : `Showing the versions to use on Mendix ${target ?? '—'}. Enter the version you are upgrading to (e.g. 10.24.0 or 11.6.0) to plan the upgrade before you make it.`
+        { class: 'muted small' },
+        target
+          ? `Read from this app. Every module and widget below is judged against Mendix ${target}: the version to use is the newest one that supports it.`
+          : 'The app’s Mendix version could not be read, so versions cannot be judged for compatibility.'
       )
     )
   );
@@ -1847,18 +2196,132 @@ function upgradesView(result: SecurityAnalysisResult): HTMLElement {
         .sort(
           (a, b) =>
             Number((wv?.byWidget[b.key]?.length ?? 0) > 0) - Number((wv?.byWidget[a.key]?.length ?? 0) > 0) ||
+            Number((b.usedIn?.length ?? 1) > 0) - Number((a.usedIn?.length ?? 1) > 0) ||
             STATUS_RANK[assessments.get(a.key)!.status] - STATUS_RANK[assessments.get(b.key)!.status] ||
             a.name.localeCompare(b.name)
         );
+    const itemCard = (i: MarketplaceItem) => upgradeCard(i, assessments.get(i.key)!, target, wv?.byWidget[i.key], wv?.accepted[i.key], wv?.overdue[i.key]);
+    // Widgets that ship inside a module cannot be updated on their own: one group per module.
+    const bundleGroup = (moduleName: string, members: MarketplaceItem[]) => {
+      const open = state.openBundles.has(moduleName) || q.length > 0;
+      const moduleItem = inventory.modules.find((m) => m.name === moduleName);
+      const moduleNote = moduleItem ? assessments.get(moduleItem.key)?.note : undefined;
+      const withAdvisories = members.filter((m) => (wv?.byWidget[m.key]?.length ?? 0) > 0).length;
+      const usageKnown = members.every((m) => m.usedIn !== undefined);
+      const placed = members.filter((m) => (m.usedIn?.length ?? 0) > 0).length;
+      const version = members[0]?.moduleVersion;
+      const el: HTMLElement = h(
+        'article',
+        { class: `finding lib bundle${withAdvisories > 0 ? ' sev-high' : ''}${open ? ' open' : ''}` },
+        h(
+          'button',
+          {
+            class: 'finding-head',
+            'aria-expanded': open ? 'true' : 'false',
+            onclick: () => {
+              if (state.openBundles.has(moduleName)) state.openBundles.delete(moduleName);
+              else state.openBundles.add(moduleName);
+              renderList();
+            },
+          },
+          withAdvisories > 0
+            ? h('span', { class: 'sev-badge sev-high' }, `${withAdvisories} with advisories`)
+            : h('span', { class: 'state state-empty' }, 'Bundled'),
+          h(
+            'span',
+            { class: 'finding-title' },
+            h('span', { class: 'rule' }, `Widgets shipped with ${moduleName}`, h('span', { class: 'lib-version' }, version ? ` ${version}` : '')),
+            h(
+              'span',
+              { class: 'artifact' },
+              `${members.length} widget${members.length === 1 ? '' : 's'}${usageKnown ? ` · ${placed} placed in the app, ${members.length - placed} not used` : ''}`
+            )
+          ),
+          h('span', { class: 'meta' }, chevronIcon())
+        ),
+        h(
+          'p',
+          { class: 'observation' },
+          `These widgets are part of the ${moduleName} module and are not on the Marketplace on their own: they change only when ${moduleName} is updated to another release.${moduleNote ? ` ${moduleNote}` : ''}`
+        ),
+        open ? h('div', { class: 'details bundle-members' }, h('div', { class: 'finding-list' }, members.map(itemCard))) : null
+      );
+      return el;
+    };
+    // Widgets whose ids share a namespace: one family card, read from the packages themselves.
+    const familyGroup = (family: string, members: MarketplaceItem[]) => {
+      const key = `family:${family}`;
+      const open = state.openBundles.has(key) || q.length > 0;
+      const withAdvisories = members.filter((m) => (wv?.byWidget[m.key]?.length ?? 0) > 0).length;
+      const usageKnown = members.every((m) => m.usedIn !== undefined);
+      const placed = members.filter((m) => (m.usedIn?.length ?? 0) > 0).length;
+      const notOnOwn = members.filter((m) => assessments.get(m.key)?.status === 'not-found').length;
+      return h(
+        'article',
+        { class: `finding lib bundle${withAdvisories > 0 ? ' sev-high' : ''}${open ? ' open' : ''}` },
+        h(
+          'button',
+          {
+            class: 'finding-head',
+            'aria-expanded': open ? 'true' : 'false',
+            onclick: () => {
+              if (state.openBundles.has(key)) state.openBundles.delete(key);
+              else state.openBundles.add(key);
+              renderList();
+            },
+          },
+          withAdvisories > 0
+            ? h('span', { class: 'sev-badge sev-high' }, `${withAdvisories} with advisories`)
+            : h('span', { class: 'state state-empty' }, 'Family'),
+          h(
+            'span',
+            { class: 'finding-title' },
+            h('span', { class: 'rule' }, 'Widget family ', h('span', { class: 'mono' }, family)),
+            h(
+              'span',
+              { class: 'artifact' },
+              `${members.length} widgets${usageKnown ? ` · ${placed} placed in the app, ${members.length - placed} not used` : ''}${notOnOwn > 0 ? ` · ${notOnOwn} not on the Marketplace on their own` : ''}`
+            )
+          ),
+          h('span', { class: 'meta' }, chevronIcon())
+        ),
+        h(
+          'p',
+          { class: 'observation' },
+          `Widgets whose ids share the namespace ${family}. Each is checked on its own. A widget the Marketplace does not list on its own was probably installed by a Marketplace module: updating that module is what updates it.`
+        ),
+        open ? h('div', { class: 'details bundle-members' }, h('div', { class: 'finding-list' }, members.map(itemCard))) : null
+      );
+    };
     const section = (title: string, hint: string, group: MarketplaceItem[]) => {
       const shown = visible(group);
       if (shown.length === 0 && state.upFilter !== 'all') return null;
+      const bundles = new Map<string, MarketplaceItem[]>();
+      for (const i of shown) if (i.bundledWith) bundles.set(i.bundledWith, [...(bundles.get(i.bundledWith) ?? []), i]);
+      // Families count across the whole widgets folder, so a filter showing one member still groups it.
+      const familySize = new Map<string, number>();
+      for (const i of group) if (!i.bundledWith && i.family) familySize.set(i.family, (familySize.get(i.family) ?? 0) + 1);
+      const families = new Map<string, MarketplaceItem[]>();
+      const standalone: MarketplaceItem[] = [];
+      for (const i of shown) {
+        if (i.bundledWith) continue;
+        if (i.family && (familySize.get(i.family) ?? 0) > 1) families.set(i.family, [...(families.get(i.family) ?? []), i]);
+        else standalone.push(i);
+      }
       return h(
         'div',
         { class: 'lib-section' },
         h('h3', {}, `${title} (${group.length})`),
         h('p', { class: 'muted small' }, hint),
-        shown.length === 0 ? h('p', { class: 'muted small' }, group.length === 0 ? 'None.' : 'None match the filter.') : h('div', { class: 'finding-list' }, shown.map((i) => upgradeCard(i, assessments.get(i.key)!, target, wv?.byWidget[i.key], wv?.accepted[i.key], wv?.overdue[i.key])))
+        shown.length === 0
+          ? h('p', { class: 'muted small' }, group.length === 0 ? 'None.' : 'None match the filter.')
+          : h(
+              'div',
+              { class: 'finding-list' },
+              [...bundles].sort(([x], [y]) => x.localeCompare(y)).map(([name, members]) => bundleGroup(name, members)),
+              [...families].sort(([x], [y]) => x.localeCompare(y)).map(([name, members]) => familyGroup(name, members)),
+              standalone.map(itemCard)
+            )
       );
     };
     const parts = [
@@ -1868,7 +2331,7 @@ function upgradesView(result: SecurityAnalysisResult): HTMLElement {
       state.upFilter !== 'modules'
         ? section(
             'Widgets',
-            'Widget packages in the widgets folder. Widgets that ship inside a module (Data Widgets, Native Mobile Resources, …) are updated by updating that module; the rest are matched to the Marketplace by name.',
+            'Widget packages in the widgets folder. A widget with the same name and version as a Marketplace module is shown with that module; widgets whose ids share a namespace are shown as one family. Each is matched to the Marketplace by name; one the Marketplace does not list on its own was probably installed by a module, and updating that module updates it.',
             inventory.widgets
           )
         : null,
@@ -1885,7 +2348,7 @@ function upgradesView(result: SecurityAnalysisResult): HTMLElement {
     'section',
     { class: 'panel libraries upgrades' },
     tabIntro(
-      'The Marketplace modules and widgets in the app: the version of each that suits the app’s Mendix version (or the version you plan to move to), and known vulnerabilities in the libraries bundled into widgets. Run checks reads the Marketplace (needs a Personal Access Token) and OSV.dev in one go. Click a card to filter; open an item for the version to use, its advisories, and to accept a reviewed risk.'
+      'The Marketplace modules and widgets in the app: the version of each that suits this app’s Mendix version, and known vulnerabilities in the libraries bundled into widgets. Run checks reads the Marketplace (needs a Personal Access Token) and OSV.dev in one go. Click a card to filter; open an item for the version to use, its advisories, and to accept a reviewed risk.'
     ),
     riskFileWarning(),
     planner,
@@ -1974,7 +2437,7 @@ function riskControls(scope: RiskScope, target: string, v: LibraryVulnerability,
       'div',
       { class: 'risk-actions' },
       overdue
-        ? h('span', { class: 'tag warn', title: overdue.reason }, `Accepted until ${overdue.reviewBy} by ${overdue.acceptedBy ?? 'someone'} — review overdue, counts again`)
+        ? h('span', { class: 'tag warn', title: overdue.reason }, `Accepted until ${overdue.reviewBy} by ${acceptedByText(overdue).who} — review overdue, counts again`)
         : null,
       h(
         'button',
@@ -2076,7 +2539,10 @@ function acceptedSection(scope: RiskScope, target: string, list: AcceptedVulnera
           h(
             'div',
             { class: 'muted small' },
-            `Accepted by ${risk.acceptedBy ?? 'unknown'}${risk.acceptedAt ? ` on ${new Date(risk.acceptedAt).toLocaleDateString()}` : ''} · review by ${risk.reviewBy}`
+            'Accepted by ',
+            h('strong', {}, acceptedByText(risk).who),
+            `${risk.acceptedAt ? ` on ${new Date(risk.acceptedAt).toLocaleDateString()}` : ''} · review by ${risk.reviewBy}`,
+            acceptedByText(risk).detail ? ` · ${acceptedByText(risk).detail}` : ''
           ),
           h(
             'div',
@@ -2125,7 +2591,14 @@ function upgradeCard(
 ): HTMLElement {
   const open = state.openUpgrades.has(item.key);
   const status = UPGRADE_STATUS[a.status];
-  const vulnerable = (vulns?.length ?? 0) > 0;
+  // Each card filter shows what it is for: "Accepted risks" only the accepted advisories,
+  // "Vulnerable widgets" only the open ones, "Updates available" the version to move to.
+  // "Everything" and the inventory filters show the whole item.
+  const view = state.upFilter;
+  const showAccepted = view === 'accepted' || view === 'all';
+  const showVulns = view !== 'accepted' && view !== 'updates';
+  const vulnerable = view !== 'accepted' && (vulns?.length ?? 0) > 0;
+  accepted = showAccepted ? accepted : [];
   const statusClass =
     a.status === 'incompatible' || a.status === 'no-compatible' ? 'sev-critical' : a.status === 'update-recommended' ? 'sev-high' : a.status === 'update-available' ? 'sev-medium' : a.status === 'up-to-date' ? 'lib-clean' : '';
   const sevClass = vulnerable ? `sev-${vulns![0]!.severity.toLowerCase()}` : statusClass;
@@ -2147,11 +2620,13 @@ function upgradeCard(
           el.replaceWith(upgradeCard(item, a, target, vulns, accepted, overdue));
         },
       },
-      vulnerable
-        ? h('span', { class: `sev-badge sev-${vulns![0]!.severity.toLowerCase()}` }, `${vulns!.length} ${vulns!.length === 1 ? 'vulnerability' : 'vulnerabilities'}`)
-        : accepted.length > 0
-          ? h('span', { class: 'state state-review', title: 'Every advisory has been reviewed and accepted' }, 'Accepted risk')
-          : h('span', { class: status.cls }, status.label),
+      view === 'accepted' && accepted.length > 0
+        ? h('span', { class: 'state state-review', title: 'Advisories reviewed and accepted for this widget' }, `${accepted.length} accepted risk${accepted.length === 1 ? '' : 's'}`)
+        : vulnerable
+          ? h('span', { class: `sev-badge sev-${vulns![0]!.severity.toLowerCase()}` }, `${vulns!.length} ${vulns!.length === 1 ? 'vulnerability' : 'vulnerabilities'}`)
+          : accepted.length > 0
+            ? h('span', { class: 'state state-review', title: 'Every advisory has been reviewed and accepted' }, 'Accepted risk')
+            : h('span', { class: status.cls }, status.label),
       h(
         'span',
         { class: 'finding-title' },
@@ -2167,19 +2642,38 @@ function upgradeCard(
       h(
         'span',
         { class: 'meta' },
-        a.recommended && a.recommended.versionNumber !== (item.bundledWith ? item.moduleVersion : item.installedVersion)
+        a.recommended && isNewer(a.recommended.versionNumber, item.bundledWith ? item.moduleVersion : item.installedVersion)
           ? h('span', { class: 'tag tag-sub', title: item.bundledWith ? `${item.bundledWith} version to move to` : 'Version to move to' }, `→ ${item.bundledWith ? `${item.bundledWith} ` : ''}${a.recommended.versionNumber}`)
+          : null,
+        item.kind === 'widget' && item.usedIn !== undefined
+          ? item.usedIn.length > 0
+            ? h('span', { class: 'tag', title: 'Pages, snippets and layouts that place this widget' }, `Used on ${item.usedIn.length}`)
+            : h('span', { class: 'tag', title: 'No page, snippet or layout places this widget' }, 'Not used')
           : null,
         item.platforms.map((p) => h('span', { class: 'tag' }, p)),
         chevronIcon()
       )
     ),
-    h('p', { class: 'observation' }, vulnerable ? widgetSecurityAdvice(item, vulns!, a, target) : a.note),
+    h(
+      'p',
+      { class: 'observation' },
+      view === 'accepted'
+        ? `${accepted.length} advisor${accepted.length === 1 ? 'y has' : 'ies have'} been reviewed and accepted for this version; they do not count until the review date.`
+        : vulnerable
+          ? `${widgetSecurityAdvice(item, vulns!, a, target)}${item.usedIn?.length === 0 ? ' The app places this widget on no page, snippet or layout, so its code does not run in the app — a lower concern than a widget in use.' : ''}`
+          : a.note
+    ),
     open
       ? h(
           'div',
           { class: 'details' },
-          vulnerable
+          vulnerable && !showVulns
+            ? detail(
+                'Known vulnerabilities',
+                `${vulns!.length} open advisor${vulns!.length === 1 ? 'y' : 'ies'} in the bundled libraries — open the "Vulnerable widgets" card to see them and accept or resolve each.`
+              )
+            : null,
+          vulnerable && showVulns
             ? h(
                 'div',
                 { class: 'detail' },
@@ -2192,10 +2686,30 @@ function upgradeCard(
               )
             : null,
           item.fileName && accepted.length > 0 ? acceptedSection('widget', item.fileName, accepted) : null,
-          vulnerable ? detail('Version status', a.note) : null,
-          indirectVulnerabilities(state.widgetOsv ? applyWidgetOsv(state.result!.upgrades, state.widgetOsv).indirectByWidget[item.key] : undefined),
+          vulnerable && view !== 'updates' ? detail('Version status', a.note) : null,
+          showVulns ? indirectVulnerabilities(state.widgetOsv ? applyWidgetOsv(state.result!.upgrades, state.widgetOsv).indirectByWidget[item.key] : undefined) : null,
+          item.usedIn && item.usedIn.length > 0
+            ? h(
+                'details',
+                { class: 'detail bundled' },
+                h('summary', { class: 'label' }, `Used in (${item.usedIn.length})`),
+                h('ul', { class: 'bundled-list mono' }, item.usedIn.map((d) => h('li', {}, h('span', {}, d))))
+              )
+            : null,
           item.dependencies.length > 0
-            ? detail('Bundled libraries', item.dependencies.map((d) => `${d.name} ${d.version}`).join(', '))
+            ? h(
+                // Collapsed by default: a widget can bundle hundreds of libraries.
+                'details',
+                { class: 'detail bundled' },
+                h('summary', { class: 'label' }, `Bundled libraries (${item.dependencies.length})`),
+                h(
+                  'ul',
+                  { class: 'bundled-list mono' },
+                  [...item.dependencies]
+                    .sort((x, y) => x.name.localeCompare(y.name))
+                    .map((d) => h('li', {}, h('span', {}, d.name), h('span', { class: 'muted' }, d.version)))
+                )
+              )
             : null,
           h(
             'dl',
@@ -2212,7 +2726,15 @@ function upgradeCard(
             ? h(
                 'div',
                 { class: 'detail-foot' },
-                h('span', { class: 'muted small' }, item.bundledWith ? `Update ${item.bundledWith} from the Marketplace to update this widget.` : contentId ? 'Update it from the Marketplace in Studio Pro.' : ''),
+                h(
+                  'span',
+                  { class: 'muted small' },
+                  item.bundledWith
+                      ? `Update ${item.bundledWith} from the Marketplace to update this widget.`
+                      : contentId
+                        ? 'Update it from the Marketplace in Studio Pro.'
+                        : ''
+                ),
                 h(
                   'span',
                   { class: 'foot-actions' },

@@ -38,6 +38,12 @@ export interface LibraryRequirement {
   direct: boolean;
   /** For a transitive dependency: the `group:artifact` the module declared that brought it in. */
   via?: string;
+  /** The module's Settings unit, which holds its Java Dependencies — what "Open in Studio Pro" opens. */
+  settingsUnitId?: string;
+  /** The version in the module's Java Dependencies row: of this library when direct, of `via` otherwise. */
+  declaredVersion?: string;
+  /** The exclusions on that row, as `group:artifact`, which must survive a version change. */
+  exclusions?: string[];
 }
 
 export interface JavaLibrary {
@@ -110,6 +116,13 @@ interface DeclaredDependency {
   group: string;
   artifact: string;
   version?: string;
+  settingsUnitId?: string;
+  exclusions: string[];
+}
+
+/** The parts of a declaration a requirement carries, so the UI can name the row to edit. */
+function rowFacts(dep: DeclaredDependency): Pick<LibraryRequirement, 'settingsUnitId' | 'declaredVersion' | 'exclusions'> {
+  return { settingsUnitId: dep.settingsUnitId, declaredVersion: dep.version, exclusions: dep.exclusions };
 }
 
 export function buildJavaLibraryReport(
@@ -147,7 +160,7 @@ export function buildJavaLibraryReport(
       if (!sbom && coordinates) {
         requiredBy = declared
           .filter((d) => d.group === coordinates.group && d.artifact === coordinates.artifact)
-          .map((d) => ({ module: d.module, moduleType: moduleTypes[d.module] ?? 'missing', direct: true }));
+          .map((d) => ({ module: d.module, moduleType: moduleTypes[d.module] ?? 'missing', direct: true, ...rowFacts(d) }));
       }
     } else {
       requiredBy = facts.requiredLibMarkers
@@ -266,7 +279,10 @@ function declaredDependencies(snapshot: ModelSnapshot): DeclaredDependency[] {
         const group = str(dep, 'groupId', 'GroupId');
         const artifact = str(dep, 'artifactId', 'ArtifactId');
         if (!group || !artifact) continue;
-        out.push({ module: module.name, group, artifact, version: str(dep, 'version', 'Version') });
+        const exclusions = children(dep, 'exclusions', 'Exclusions')
+          .map((x) => [str(x, 'groupId', 'GroupId'), str(x, 'artifactId', 'ArtifactId')].filter(Boolean).join(':'))
+          .filter((x) => x.length > 0);
+        out.push({ module: module.name, group, artifact, version: str(dep, 'version', 'Version'), settingsUnitId: unit.$ID, exclusions });
       }
     }
   }
@@ -296,7 +312,7 @@ function reachFromDeclarations(
       seen.add(ref);
       const list = reach.get(ref) ?? [];
       const direct = roots.includes(ref);
-      list.push({ module: dep.module, moduleType: moduleTypes[dep.module] ?? 'missing', direct, via: direct ? undefined : via });
+      list.push({ module: dep.module, moduleType: moduleTypes[dep.module] ?? 'missing', direct, via: direct ? undefined : via, ...rowFacts(dep) });
       reach.set(ref, list);
       queue.push(...(edges.get(ref) ?? []));
     }

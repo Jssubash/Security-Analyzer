@@ -851,7 +851,7 @@ function indexReferences(snapshot: ModelSnapshot, microflows: Record<string, Mic
       if (file.content.includes(`"${name}"`)) list.push({ qualifiedName: file.relativePath, kind: 'JavaSource' });
     }
   }
-  // A constant whose value is a microflow name is how modules such as SAML20 call a configurable
+  // A constant whose value is a microflow name is how some modules call a configurable
   // microflow by name at runtime (Core.microflowCall on the constant's value).
   for (const module of snapshot.modules) {
     for (const unit of module.units) {
@@ -886,6 +886,7 @@ function extractMicroflows(flowUnits: OwnedUnit[], locator: UnitLocator, notes: 
       returnType: 'Unknown',
       parameters: body?.parameters ?? [],
       activities: body?.activities ?? [],
+      returnValues: body?.returnValues,
       cyclomaticComplexity: 0,
       hasErrorHandling: false,
       callsMicroflows: [],
@@ -967,8 +968,27 @@ function resolvePageData(
     const name = str(node, 'Name') ?? node.$Name;
     const page = name ? pages[`${module.name}.${name}`] : undefined;
     if (!page || !has(node, ['$References'])) continue;
-    page.dataEntities = resolveDataEntities(strList(node, '$References'), context);
+    const references = strList(node, '$References');
+    page.dataEntities = resolveDataEntities(references, context);
+    page.references = withSnippetReferences(references, snippetReferences);
   }
+}
+
+/** A page's references plus those of the snippets it embeds, at any depth. */
+function withSnippetReferences(references: string[], snippets: Map<string, string[]>): string[] {
+  const out = new Set(references);
+  const queue = references.filter((r) => snippets.has(r));
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    for (const r of snippets.get(name) ?? []) {
+      out.add(r);
+      if (snippets.has(r)) queue.push(r);
+    }
+  }
+  return [...out].sort();
 }
 
 // ====================================================================== constants
@@ -1003,8 +1023,7 @@ function extractConstants(constantUnits: OwnedUnit[], locator: UnitLocator): Ope
 /**
  * Published REST services, for SEC-004.
  *
- * The reference project publishes none, so this mapping is not yet verified against a real
- * service. It is written to fail quiet rather than loud: a service whose authentication setting
+ * It is written to fail quiet rather than loud: a service whose authentication setting
  * cannot be read is skipped with a note, because reporting it as "no authentication" would be a
  * Critical finding built on a missing property.
  */
@@ -1064,17 +1083,29 @@ function extractJavaActions(
   modules: Record<string, Module>
 ): JavaActionSummary[] {
   const byLowerName = new Map(Object.keys(modules).map((m) => [m.toLowerCase(), m]));
-  return snapshot.javaSources.map((file) => ({
-    name: file.fileName.replace(/\.java$/i, ''),
-    module: byLowerName.get(file.moduleDirectory.toLowerCase()) ?? file.moduleDirectory,
-    sourceFile: file.relativePath,
-    usesExternalLibraries: [],
-    hasRegexXssSanitizer: usesRegexXssSanitizer(file.content),
-  }));
+  // Classes of each module directory, by simple name, so an action that delegates to a helper of
+  // its own module is judged by the helper's code too.
+  const classes = new Map<string, Map<string, string>>();
+  for (const file of snapshot.javaSources) {
+    const dir = file.moduleDirectory.toLowerCase();
+    if (!classes.has(dir)) classes.set(dir, new Map());
+    classes.get(dir)!.set(file.fileName.replace(/\.java$/i, ''), file.content ?? '');
+  }
+  return snapshot.javaSources.map((file) => {
+    const content = file.content ?? '';
+    const own = classes.get(file.moduleDirectory.toLowerCase()) ?? new Map<string, string>();
+    const helpers = [...own].filter(([name, code]) => code !== content && new RegExp(`\\b${name}\\b`).test(content)).map(([, code]) => code);
+    return {
+      name: file.fileName.replace(/\.java$/i, ''),
+      module: byLowerName.get(file.moduleDirectory.toLowerCase()) ?? file.moduleDirectory,
+      sourceFile: file.relativePath,
+      usesExternalLibraries: [],
+      encrypts: file.content === undefined ? undefined : [content, ...helpers].some(encryptsWithCipher),
+    };
+  });
 }
 
-/** Hand-rolled regex XSS filtering; the same test as the parser's filesystem extractor. */
-export function usesRegexXssSanitizer(source: string): boolean {
-  if (!/replaceAll\s*\(|replaceFirst\s*\(|Pattern\.compile/.test(source)) return false;
-  return /<\s*script|javascript:|onerror\s*=|xss/i.test(source);
+/** Java code that encrypts with the Java platform's own cipher API. */
+function encryptsWithCipher(code: string): boolean {
+  return /\bCipher\b/.test(code) && /\bENCRYPT_MODE\b/.test(code);
 }

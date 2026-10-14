@@ -53,7 +53,7 @@ export interface AnalysisOptions {
 }
 
 export interface SecurityAnalysisResult {
-  app: { name: string; studioProVersion?: string; directory?: string };
+  app: { name: string; studioProVersion?: string; directory?: string; javaVersion?: string };
   analyzedAt: string;
   durationMs: number;
   score: ScoreReport;
@@ -96,16 +96,6 @@ const SEVERITY_ORDER: Record<RuleSeverity, number> = {
 };
 
 /**
- * Rules of the shared catalogue that the extension does not run.
- *
- * SEC-007 (regex-based XSS sanitiser in a Java action) is pattern matching on Java source: it
- * cannot tell a sanitiser from any other regular expression, and in practice it flagged the
- * Marketplace FeedbackModule's own action, which the team cannot change. Removed at the team's
- * request; the web dashboard keeps it.
- */
-export const EXCLUDED_RULES = new Set(['SEC-007']);
-
-/**
  * The individual values each rule reads, beyond the fact groups it declares in `requires`.
  *
  * The engine skips a rule only when a whole group is unreadable. Inside a readable group a single
@@ -128,7 +118,6 @@ export const RULE_INPUTS: Record<string, readonly UnreadFact[]> = {
   'SEC-003': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles', 'accessRuleRoles'],
   'SEC-020': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles', 'accessRuleRoles'],
   'SEC-029': ['enableGuestAccess', 'guestUserRole', 'userRoleModuleRoles', 'accessRuleRoles'],
-  'SEC-021': ['userRoleModuleRoles', 'accessRuleRoles'],
   'SEC-022': ['entityOwner', 'accessRuleRoles'],
   'SEC-EE-003': ['accessRuleRoles'],
   'SEC-005': ['attributeTypes'],
@@ -189,7 +178,7 @@ function guarded(rule: Rule, diagnostics: ReadDiagnostics): Rule {
 }
 
 export function securityCatalogue(options: AnalysisOptions = {}): Rule[] {
-  return securityRules.filter((rule) => !EXCLUDED_RULES.has(rule.id)).map((rule) => {
+  return securityRules.map((rule) => {
     const override = options.enabledRules?.[rule.id];
     return override === undefined ? rule : { ...rule, enabled: override };
   });
@@ -270,6 +259,7 @@ export function analyzeSnapshot(
       name: snapshot.app.name,
       studioProVersion: snapshot.app.studioProVersion,
       directory: snapshot.app.directory,
+      javaVersion: snapshot.app.javaVersion,
     },
     analyzedAt: new Date(started).toISOString(),
     durationMs: Math.max(0, now() - started),
@@ -302,7 +292,7 @@ export function analyzeSnapshot(
  * The Studio Pro unit a finding points at, for "Open in Studio Pro".
  *
  * Findings name artifacts logically (`AppSecurity.UserRoles.Anonymous`,
- * `MyFirstModule.RequestForm.Email`); this walks up the dotted path until it reaches a name the
+ * `Module.Entity.Attribute`); this walks up the dotted path until it reaches a name the
  * snapshot recorded a unit for — a member resolves to its entity's domain model.
  */
 /**

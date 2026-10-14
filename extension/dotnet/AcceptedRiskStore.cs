@@ -8,7 +8,9 @@ namespace MendixGovernance.SecurityAnalyzer;
 /// Reads and writes the app's accepted-risk decisions, <c>.security-analyzer/accepted-risks.json</c>
 /// in the app folder. Kept with the app so the decisions are committed, shared with the team and
 /// reviewed like any other change. The pane proposes a decision; this class validates it and
-/// stamps who accepted it (the Windows user name) and when, so neither can be typed in.
+/// stamps who accepted it and when, so neither can be typed in. "Who" is the person's Git identity
+/// (name and email, see <see cref="GitIdentity"/>) — the name their commits carry — with the Windows
+/// account kept beside it; on a computer without a Git identity it is the Windows account alone.
 /// </summary>
 internal static class AcceptedRiskStore
 {
@@ -50,10 +52,14 @@ internal static class AcceptedRiskStore
             ["package"] = Text(proposed, "package"),
             ["version"] = Text(proposed, "version"),
             ["reason"] = Text(proposed, "reason")?.Trim(),
-            ["acceptedBy"] = Environment.UserName,
             ["acceptedAt"] = DateTime.UtcNow.ToString("o"),
             ["reviewBy"] = Text(proposed, "reviewBy"),
         };
+        var (gitName, gitEmail) = GitIdentity.Read(directory);
+        risk["acceptedBy"] = gitName ?? Environment.UserName;
+        risk["acceptedByEmail"] = gitName is null ? null : gitEmail;
+        risk["acceptedByAccount"] = Environment.UserName;
+        risk["acceptedBySource"] = gitName is null ? "windows" : "git";
         var problem = Validate(risk);
         if (problem is not null) throw new ArgumentException(problem);
 

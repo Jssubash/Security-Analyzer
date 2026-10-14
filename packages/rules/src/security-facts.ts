@@ -5,15 +5,15 @@
  * answer across the catalogue. The old rules each re-derived it, and inconsistently: SEC-003
  * matched `role.toLowerCase().includes('anonymous')` on the *module role's* name, SEC-006
  * matched the *user role's* name against a hardcoded marketplace list, and SEC-009 looked for
- * a module role literally called `user`. On the reference project the first found nothing, the
- * second missed `Atlas_Core.Administrator`, and the third fired on an unrelated grant.
+ * a module role literally called `user`. The first could find nothing, the second missed any
+ * administrator role not on its list, and the third fired on unrelated grants.
  *
  * The real relationship is one step of indirection: a *user role* is granted *module roles*,
  * and a visitor who never logs in holds the guest user role's module roles. Everything below
  * is that one traversal, done once.
  */
 
-import type { AccessRule, ApplicationIR, Attribute, Entity, UserRole } from '@mendix-analyzer/application-ir';
+import type { AccessRule, Activity, ApplicationIR, Attribute, Entity, Microflow, UserRole } from '@mendix-analyzer/application-ir';
 
 /**
  * Attribute types that can carry a secret or a piece of PII.
@@ -51,26 +51,6 @@ export function guestModuleRoles(ir: ApplicationIR): Set<string> {
   const guest = guestUserRole(ir);
   if (!guest) return new Set();
   return new Set(guest.moduleRoles.map((m) => `${m.module}.${m.role}`));
-}
-
-/**
- * Module roles granted to more than one user role.
- *
- * §6.3 defines "broad" this way for SEC-021. A role held by several user roles is one whose
- * grants reach a wider audience than its name suggests, which is what makes a sensitive
- * member visible to people the modeller was not thinking about.
- */
-export function broadModuleRoles(ir: ApplicationIR): Set<string> {
-  const holders = new Map<string, Set<string>>();
-  for (const userRole of ir.security.userRoles) {
-    for (const moduleRole of userRole.moduleRoles) {
-      const key = `${moduleRole.module}.${moduleRole.role}`;
-      const set = holders.get(key);
-      if (set) set.add(userRole.name);
-      else holders.set(key, new Set([userRole.name]));
-    }
-  }
-  return new Set([...holders].filter(([, names]) => names.size > 1).map(([key]) => key));
 }
 
 /** Every qualified module role granted to at least one user role. */
@@ -216,4 +196,75 @@ export function guestHasAccessTo(
     current = current.generalization ? ir.entities[current.generalization] : undefined;
   }
   return false;
+}
+
+// ======================================================================== microflow exposure
+
+/** Documents that put a microflow behind something a user clicks or opens in the browser. */
+export const UI_REFERRERS = new Set(['Page', 'Snippet', 'Layout', 'NavigationDocument', 'BuildingBlock', 'PageTemplate']);
+
+/** The roles that are neither administrators (by name) nor System roles. */
+export function nonAdministrativeRoles(roles: readonly string[]): string[] {
+  return roles.filter((qualified) => {
+    const dot = qualified.indexOf('.');
+    return qualified.slice(0, dot) !== 'System' && !isAdministratorRole(qualified.slice(dot + 1));
+  });
+}
+
+/**
+ * The pages, snippets, layouts and navigation items that start the microflow; `undefined` when
+ * where-used was not read, so "not used from the UI" is never concluded from missing data.
+ */
+export function uiTriggers(mf: Microflow): { kind: string; qualifiedName: string }[] | undefined {
+  return mf.referencedBy?.filter((r) => UI_REFERRERS.has(r.kind));
+}
+
+/**
+ * Whether SEC-MF-001 reports this microflow: entity access off, allowed for a non-administrative
+ * role, and started from the UI. SEC-028 leaves these to SEC-MF-001 so one problem is reported once.
+ */
+export function isUserFacingWithoutEntityAccess(ir: ApplicationIR, mf: Microflow): boolean {
+  if (mf.appliesEntityAccess !== false || isPlatformModule(ir, mf.module)) return false;
+  if (nonAdministrativeRoles(mf.allowedRoles).length === 0) return false;
+  return (uiTriggers(mf)?.length ?? 0) > 0;
+}
+
+/**
+ * What a microflow itself does with stored data, which is what decides how much "Apply entity
+ * access" off matters:
+ *
+ *   - `writes`: creates, changes, deletes or commits objects of a persistable entity;
+ *   - `reads`: retrieves a persistable entity from the database, and writes nothing;
+ *   - `calls`: no data step of its own, but calls other microflows, which may have some;
+ *   - `none`: touches no stored data, so the setting changes nothing today.
+ *
+ * `undefined` when microflow contents were not read: the caller then keeps its default severity.
+ * A step whose entity cannot be resolved counts as stored data — the cautious reading.
+ */
+export type DataAccess = 'writes' | 'reads' | 'calls' | 'none';
+
+const WRITES = new Set(['CreateAction', 'ChangeAction', 'DeleteAction', 'CommitAction']);
+
+export function dataAccess(ir: ApplicationIR, mf: Microflow): { level: DataAccess; steps: string[] } | undefined {
+  if (ir.coverage?.microflowActivities === 'NOT_ANALYZABLE') return undefined;
+  const stored = (a: Activity) => a.targetEntity === undefined || isPersistableEntity(ir, a.targetEntity);
+  const describe = (a: Activity, verb: string) => `${verb} ${a.targetEntity ?? 'an object'}`;
+  const writes = mf.activities.filter((a) => WRITES.has(a.type) && stored(a));
+  if (writes.length > 0) {
+    const verbs: Record<string, string> = { CreateAction: 'create', ChangeAction: 'change', DeleteAction: 'delete', CommitAction: 'commit' };
+    return { level: 'writes', steps: writes.map((a) => describe(a, verbs[a.type] ?? a.type)) };
+  }
+  const reads = mf.activities.filter((a) => a.type === 'RetrieveAction' && a.properties['retrieveSource'] === 'database' && stored(a));
+  if (reads.length > 0) return { level: 'reads', steps: reads.map((a) => describe(a, 'retrieve')) };
+  const calls = mf.activities.filter((a) => a.type === 'MicroflowCall');
+  if (calls.length > 0) {
+    return { level: 'calls', steps: calls.map((a) => `call ${String(a.properties['callee'] ?? 'a microflow')}`) };
+  }
+  return { level: 'none', steps: [] };
+}
+
+/** "change Shop.Order, delete Shop.Line and 3 more" — distinct steps, at most three named. */
+export function stepList(steps: string[]): string {
+  const unique = [...new Set(steps)];
+  return unique.length <= 3 ? unique.join(', ') : `${unique.slice(0, 3).join(', ')} and ${unique.length - 3} more`;
 }

@@ -28,8 +28,17 @@ export interface AcceptedRisk {
   /** The library version the decision was made for. */
   version: string;
   reason: string;
-  /** Windows user name, stamped by the host. */
+  /**
+   * Who accepted it, stamped by the host: the person's Git name (`user.name`), or the Windows
+   * account when no Git identity is set. Older decisions hold the Windows account only.
+   */
   acceptedBy?: string;
+  /** Their Git email (`user.email`), when `acceptedBy` came from Git. */
+  acceptedByEmail?: string;
+  /** The Windows account the decision was recorded from. */
+  acceptedByAccount?: string;
+  /** Where `acceptedBy` came from; absent on decisions recorded before Git identities were used. */
+  acceptedBySource?: 'git' | 'windows';
   /** ISO timestamp, stamped by the host. */
   acceptedAt?: string;
   /** `YYYY-MM-DD`. After this date the advisory counts as open again. */
@@ -111,6 +120,28 @@ export function splitByAcceptance(
     }
   }
   return out;
+}
+
+/**
+ * Who accepted a decision, for display: the Git name with the email in brackets, and the Windows account
+ * as a detail. A decision recorded without a Git identity — or before identities were recorded —
+ * names the Windows account and says so, rather than passing an account name off as a person.
+ */
+export function acceptedByText(r: Pick<AcceptedRisk, 'acceptedBy' | 'acceptedByEmail' | 'acceptedByAccount' | 'acceptedBySource'>): {
+  who: string;
+  detail?: string;
+} {
+  if (!r.acceptedBy) return { who: 'unknown' };
+  if (r.acceptedBySource === 'git') {
+    return {
+      who: r.acceptedByEmail ? `${r.acceptedBy} (${r.acceptedByEmail})` : r.acceptedBy,
+      detail: r.acceptedByAccount ? `Windows account ${r.acceptedByAccount}` : undefined,
+    };
+  }
+  return {
+    who: `${r.acceptedBy} (Windows account)`,
+    detail: r.acceptedBySource === 'windows' ? 'no Git identity was set on that computer' : undefined,
+  };
 }
 
 /** Decisions that no longer match anything found — the library was upgraded or removed. */

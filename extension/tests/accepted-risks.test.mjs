@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { addDays, riskKey, splitByAcceptance, staleRisks, today, validateRisk } from '../dist/analyzer.cjs';
+import { acceptedByText, addDays, riskKey, splitByAcceptance, staleRisks, today, validateRisk } from '../dist/analyzer.cjs';
 
 const vuln = (id, pkg = 'lodash', version = '4.17.21') => ({ id, cves: [], summary: id, severity: 'High', package: pkg, version, bundled: true, cwes: [] });
 const decision = (over = {}) => ({
@@ -77,5 +77,26 @@ describe('dates', () => {
     assert.equal(addDays('2026-12-30', 3), '2027-01-02');
     assert.equal(addDays('2026-10-05', 90), '2027-01-03');
     assert.match(today(), /^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+describe('who accepted it', () => {
+  test('a Git identity names the person, with their email and the Windows account as detail', () => {
+    assert.deepEqual(
+      acceptedByText({ acceptedBy: 'Subash JS', acceptedByEmail: 'subash.js@example.com', acceptedByAccount: 'mx', acceptedBySource: 'git' }),
+      { who: 'Subash JS (subash.js@example.com)', detail: 'Windows account mx' }
+    );
+  });
+
+  test('without a Git identity it says the name is a Windows account', () => {
+    assert.deepEqual(acceptedByText({ acceptedBy: 'mx', acceptedByAccount: 'mx', acceptedBySource: 'windows' }), {
+      who: 'mx (Windows account)',
+      detail: 'no Git identity was set on that computer',
+    });
+  });
+
+  test('a decision recorded before identities were used is shown as the Windows account it holds', () => {
+    assert.deepEqual(acceptedByText({ acceptedBy: 'mx' }), { who: 'mx (Windows account)', detail: undefined });
+    assert.deepEqual(acceptedByText({}), { who: 'unknown' });
   });
 });

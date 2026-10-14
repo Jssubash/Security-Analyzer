@@ -74,7 +74,7 @@ export interface IndexItem {
 export type AccessRights = 'None' | 'ReadOnly' | 'ReadWrite';
 
 export interface MemberAccessRule {
-  /** Qualified member name, e.g. `MyFirstModule.RequestForm.Email`. */
+  /** Qualified member name, `Module.Entity.Attribute`. */
   attributeOrAssociation: string;
   /** Whether this entry refers to an association rather than an attribute. */
   isAssociation: boolean;
@@ -161,6 +161,8 @@ export interface Microflow {
    * MicroflowCall, JavaActionCall, RestCall, Decision, or the model's own name for anything else.
    */
   activities: Activity[];
+  /** The return value expression of each end event that has one (e.g. `$Result`). */
+  returnValues?: string[];
   cyclomaticComplexity: number;
   hasErrorHandling: boolean;
   callsMicroflows: string[];
@@ -240,6 +242,12 @@ export interface Page {
    * when the page's contents were not read, which is not the same as "uses no data".
    */
   dataEntities?: string[];
+  /**
+   * Qualified names the page refers to, including those of the snippets it embeds — among them
+   * the attributes its widgets show or edit (`Module.Entity.Attribute`). `undefined` when the
+   * page's contents were not read.
+   */
+  references?: string[];
   navigationPath?: string;
   documentation?: string;
   provenance?: Provenance;
@@ -359,7 +367,12 @@ export interface JavaActionSummary {
   module: string;
   sourceFile?: string;
   usesExternalLibraries: string[];
-  hasRegexXssSanitizer?: boolean;
+  /**
+   * Whether the action's Java code encrypts: it (or a class of its module it names) uses Java's own
+   * `javax.crypto.Cipher` in `ENCRYPT_MODE`. Read from the source, so it holds for any module's
+   * action; `undefined` when the source was not read.
+   */
+  encrypts?: boolean;
 }
 
 export interface JavaScriptActionSummary {

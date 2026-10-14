@@ -1,5 +1,5 @@
 /**
- * `docs/security.md` §8 test 3 — one firing IR and one quiet IR for each of the 35 SEC rules.
+ * `docs/security.md` §8 test 3 — one firing IR and one quiet IR for each of the 33 SEC rules.
  *
  * The quiet case is the half that earns its keep. A rule that fires on the reference project may
  * be firing for a reason nobody intended, and a rule whose quiet case is missing can be a rule
@@ -385,74 +385,6 @@ const CASES = [
     ],
   },
   {
-    id: 'SEC-021',
-    what: 'a PII member readable by a module role held by two user roles',
-    fires: () =>
-      makeIr({
-        security: {
-          userRoles: [userRole('Staff', ['App.User']), userRole('Manager', ['App.User'])],
-          moduleRoles: [moduleRole('App.User')],
-        },
-        entities: byQualifiedName([
-          entity('App.Contact', {
-            attributes: [attribute('Email', 'String', { isPii: true, sensitivityTerm: 'email' })],
-            accessRules: [
-              accessRule(['App.User'], {
-                memberAccess: [
-                  { attributeOrAssociation: 'App.Contact.Email', isAssociation: false, access: 'ReadOnly' },
-                ],
-              }),
-            ],
-          }),
-        ]),
-      }),
-    quiet: [
-      [
-        'the same member behind a role held by one user role',
-        () =>
-          makeIr({
-            security: { userRoles: [userRole('Staff', ['App.User'])], moduleRoles: [moduleRole('App.User')] },
-            entities: byQualifiedName([
-              entity('App.Contact', {
-                attributes: [attribute('Email', 'String', { isPii: true, sensitivityTerm: 'email' })],
-                accessRules: [
-                  accessRule(['App.User'], {
-                    memberAccess: [
-                      { attributeOrAssociation: 'App.Contact.Email', isAssociation: false, access: 'ReadOnly' },
-                    ],
-                  }),
-                ],
-              }),
-            ]),
-          }),
-      ],
-      [
-        // The structural guard from §6.6: a Boolean cannot hold an email address, so a name
-        // match on `_showEmail` is not evidence of a disclosure.
-        'a Boolean whose name matches a PII term',
-        () =>
-          makeIr({
-            security: {
-              userRoles: [userRole('Staff', ['App.User']), userRole('Manager', ['App.User'])],
-              moduleRoles: [moduleRole('App.User')],
-            },
-            entities: byQualifiedName([
-              entity('App.Contact', {
-                attributes: [attribute('_showEmail', 'Boolean', { isPii: true, sensitivityTerm: 'email' })],
-                accessRules: [
-                  accessRule(['App.User'], {
-                    memberAccess: [
-                      { attributeOrAssociation: 'App.Contact._showEmail', isAssociation: false, access: 'ReadOnly' },
-                    ],
-                  }),
-                ],
-              }),
-            ]),
-          }),
-      ],
-    ],
-  },
-  {
     id: 'SEC-022',
     what: 'an owned-data entity whose rule has no XPath constraint',
     fires: () =>
@@ -508,6 +440,33 @@ const CASES = [
             entities: byQualifiedName([
               entity('App.Account', {
                 attributes: [attribute('Password', 'HashedString', { isSensitive: true, sensitivityTerm: 'password' })],
+              }),
+            ]),
+          }),
+      ],
+      [
+        // Never written to the database, so nothing is stored as plain text.
+        'the same attribute on a non-persistable entity',
+        () =>
+          makeIr({
+            entities: byQualifiedName([
+              entity('App.TokenResponse', {
+                persistenceType: 'non-persistable',
+                attributes: [attribute('Access_token', 'String', { isSensitive: true, sensitivityTerm: 'token' })],
+              }),
+            ]),
+          }),
+      ],
+      [
+        // Persistence is inherited: a specialization of a non-persistable entity is not stored either.
+        'the same attribute on a specialization of a non-persistable entity',
+        () =>
+          makeIr({
+            entities: byQualifiedName([
+              entity('App.Login', { persistenceType: 'non-persistable' }),
+              entity('App.LoginForm', {
+                generalization: 'App.Login',
+                attributes: [attribute('Password', 'String', { isSensitive: true, sensitivityTerm: 'password' })],
               }),
             ]),
           }),
@@ -607,30 +566,7 @@ const CASES = [
     ],
   },
 
-  // --- 6.5 code, constants & integration ------------------------------------------------------
-  {
-    id: 'SEC-007',
-    what: 'a regex-based XSS sanitiser',
-    fires: () =>
-      makeIr({
-        customCode: {
-          javaActions: [
-            { name: 'Sanitize', module: 'App', usesExternalLibraries: [], hasRegexXssSanitizer: true },
-          ],
-        },
-      }),
-    quiet: [
-      [
-        'a java action with no regex filtering',
-        () =>
-          makeIr({
-            customCode: {
-              javaActions: [{ name: 'Sanitize', module: 'App', usesExternalLibraries: [], hasRegexXssSanitizer: false }],
-            },
-          }),
-      ],
-    ],
-  },
+  // --- 6.5 constants & integration ------------------------------------------------------------
   {
     id: 'SEC-026',
     what: 'a credential constant carrying a value',
@@ -983,7 +919,538 @@ const CASES = [
       ['it is in a Marketplace module', () => makeIr({ microflows: byQualifiedName([microflow('Market.ACT_Old', { allowedRoles: ['Market.User'], referencedBy: [] })]) })],
     ],
   },
+  {
+    id: 'SEC-MF-006',
+    what: 'a REST call that keeps the default "Rollback" error handling',
+    fires: () => flowIr([microflow('App.ACT_Send', { activities: [mfStep('RestCall', { properties: { errorHandlingType: 'Rollback' } })] })]),
+    quiet: [
+      [
+        'custom error handling with a Log message on the error flow',
+        () => flowIr([microflow('App.ACT_Send', { activities: [handled('RestCall', { logs: true, calls: [] })] })]),
+      ],
+      [
+        'custom error handling whose error flow calls a microflow that logs',
+        () =>
+          flowIr([
+            microflow('App.ACT_Send', { activities: [handled('ImportMapping', { logs: false, calls: ['App.SUB_LogError'] })] }),
+            microflow('App.SUB_LogError', { activities: [mfStep('LogMessage')] }),
+          ]),
+      ],
+      [
+        'a Java action whose error handling is "Continue"',
+        () => flowIr([microflow('App.ACT_Send', { activities: [mfStep('JavaActionCall', { properties: { errorHandlingType: 'Continue', callee: 'App.Send' } })] })]),
+      ],
+      [
+        'a disabled activity',
+        () => flowIr([microflow('App.ACT_Send', { activities: [mfStep('RestCall', { properties: { errorHandlingType: 'Rollback', disabled: true } })] })]),
+      ],
+      [
+        'a Java action in a Marketplace microflow that does not run in the background',
+        () => flowIr([microflow('Market.ACT_Trim', { activities: [mfStep('JavaActionCall', { properties: { errorHandlingType: 'Rollback', callee: 'Market.Trim' } })] })]),
+      ],
+      [
+        'an activity that is not an integration call',
+        () => flowIr([microflow('App.ACT_Save', { activities: [mfStep('CommitAction', { properties: { errorHandlingType: 'Rollback' } })] })]),
+      ],
+    ],
+  },
+  {
+    id: 'SEC-MF-007',
+    what: 'a Change object that parses a value with no empty check or default',
+    fires: () => memberIr([setsMember('parseInteger($Department/AgeText)')]),
+    quiet: [
+      ['the value is checked for empty first', () => memberIr([setsMember('if $Department/AgeText != empty then parseInteger($Department/AgeText) else 0')])],
+      ['the parse has a default value', () => memberIr([setsMember('parseInteger($Department/AgeText, 0)')])],
+      ['a value of the same type is copied', () => memberIr([setsMember('$Department/Name')])],
+    ],
+  },
+  {
+    id: 'SEC-MF-008',
+    what: 'a microflow applying entity access, allowed for a role that may only read what it changes',
+    fires: () => saveIr([changeName()]),
+    quiet: [
+      ['every allowed role may create what it creates', () => removeHr(saveIr([createCopy()]))],
+      ['the microflow does not apply entity access', () => withoutEntityAccess(saveIr([changeName()]))],
+    ],
+  },
 ];
+
+function removeHr(ir) {
+  ir.microflows['App.ACT_Save'].allowedRoles = ['App.Admin', 'App.User'];
+  return ir;
+}
+
+function withoutEntityAccess(ir) {
+  ir.microflows['App.ACT_Save'].appliesEntityAccess = false;
+  return ir;
+}
+
+/** A Change object activity that sets `attribute` to `value`, with object variables in scope. */
+function setsMember(value, variables = { Department: 'App.Department' }) {
+  return mfStep('ChangeAction', { properties: { members: [{ attribute: 'App.Request.Field', value }], variables } });
+}
+
+function memberIr(activities, extra = {}) {
+  return makeIr({
+    entities: byQualifiedName([
+      entity('App.Department', { attributes: [attribute('AgeText', 'String'), attribute('Count', 'Integer'), attribute('Name', 'String')] }),
+    ]),
+    microflows: byQualifiedName([microflow('App.ACT_Map', { activities, ...extra })]),
+  });
+}
+
+describe('SEC-MF-007 — value converted without an empty check', () => {
+  const only = (ir) => evaluate('SEC-MF-007', ir);
+  const fires = (value) => only(memberIr([setsMember(value)]));
+
+  for (const value of [
+    'parseInteger($Department/AgeText)',
+    "parseDecimal($Department/AgeText, '#.##')",
+    "parseDateTime($Department/AgeText, 'dd-MM-yyyy')",
+    "formatDateTime($Department/JoinDate, 'dd-MM-yyyy')",
+    'toString($Department/Count)',
+    'getCaption($Department/Status)',
+    'round($Department/Amount)',
+    'addDays($Department/JoinDate, 1)',
+    '$Department/Count * 2',
+    '$Department/Count + 1',
+  ]) {
+    it(`reports ${value}`, () => {
+      const findings = fires(value);
+      assert.equal(findings.length, 1, value);
+      assert.equal(findings[0].severity, 'Medium');
+    });
+  }
+
+  for (const value of [
+    '$Department/AgeText',
+    "'Name: ' + $Department/Name",
+    'parseInteger($Department/AgeText, 0)',
+    'parseDecimal($Department/AgeText, 0)',
+    "parseDateTime($Department/AgeText, 'dd-MM-yyyy', dateTime(1900))",
+    'if $Department/AgeText != empty then parseInteger($Department/AgeText) else 0',
+    'if empty = $Department/Count then 0 else $Department/Count * 2',
+    'toString(parseInteger($Department/AgeText, 0))',
+  ]) {
+    it(`stays quiet on ${value}`, () => assert.deepEqual(fires(value), []));
+  }
+
+  it('accepts a Decision before the activity that checks the value', () => {
+    const findings = only(memberIr([mfStep('Decision', { properties: { expression: '$Department/AgeText != empty' } }), setsMember('parseInteger($Department/AgeText)')]));
+    assert.deepEqual(findings, []);
+  });
+
+  it('blames the innermost function that reads the value', () => {
+    const [finding] = fires("parseDateTime(formatDateTime($Department/JoinDate, 'dd-MM-yyyy'), 'dd-MM-yyyy')");
+    assert.equal(finding.evidence.details.conversions[0].problem, 'formatDateTime($Department/JoinDate) without an empty check');
+    assert.match(finding.observation, /Change object → App\.Request\.Field \(formatDateTime\)/);
+  });
+
+  it('is High when the microflow runs in the background', () => {
+    const findings = only(memberIr([setsMember('parseInteger($Department/AgeText)')], { referencedBy: [{ qualifiedName: 'App.Nightly', kind: 'ScheduledEvent' }] }));
+    assert.equal(findings[0].severity, 'High');
+  });
+
+  it('names the activity, member and expression, one evidence item per member', () => {
+    const [finding] = fires('parseInteger($Department/AgeText)');
+    assert.deepEqual(finding.evidence.details.conversions, [
+      {
+        activity: 'Change object',
+        member: 'App.Request.Field',
+        expression: 'parseInteger($Department/AgeText)',
+        problem: 'parseInteger($Department/AgeText) without a default value or empty check',
+        activityId: 'ChangeAction-1',
+      },
+    ]);
+    assert.match(finding.observation, /Change object → App\.Request\.Field \(parseInteger\)\. The evidence shows each expression\./);
+  });
+});
+
+/**
+ * The save scenario: ACT_Save applies entity access and is allowed for Admin, User and HR.
+ * Department: Admin may do everything on own objects (XPath owner), User may write, HR may only read.
+ * Copy: Admin and User may create and write; HR has no access rule.
+ */
+function saveIr(activities, extra = {}) {
+  const rw = (name) => ({ attributeOrAssociation: `App.Department.${name}`, isAssociation: false, access: 'ReadWrite' });
+  const ro = (name) => ({ attributeOrAssociation: `App.Department.${name}`, isAssociation: false, access: 'ReadOnly' });
+  return makeIr({
+    entities: byQualifiedName([
+      entity('App.Department', {
+        accessRules: [
+          accessRule(['App.Admin'], { allowCreate: true, allowDelete: true, xPathConstraint: "[System.owner='[%CurrentUser%]']", memberAccess: [rw('Name')] }),
+          accessRule(['App.User'], { memberAccess: [rw('Name')] }),
+          accessRule(['App.HR'], { memberAccess: [ro('Name')] }),
+        ],
+      }),
+      entity('App.Copy', {
+        accessRules: [accessRule(['App.Admin', 'App.User'], { allowCreate: true, allowDelete: true, memberAccess: [{ attributeOrAssociation: 'App.Copy.Name', isAssociation: false, access: 'ReadWrite' }] })],
+      }),
+      entity('App.Draft', { persistenceType: 'non-persistable', accessRules: [] }),
+    ]),
+    security: {
+      userRoles: [userRole('Administrator', ['App.Admin']), userRole('Initiator', ['App.User']), userRole('HR', ['App.HR'])],
+      moduleRoles: [moduleRole('App.Admin'), moduleRole('App.User'), moduleRole('App.HR')],
+    },
+    microflows: byQualifiedName([
+      microflow('App.ACT_Save', { appliesEntityAccess: true, allowedRoles: ['App.Admin', 'App.User', 'App.HR'], activities }),
+      ...(extra.microflows ?? []),
+    ]),
+  });
+}
+
+const changeName = () => mfStep('ChangeAction', { targetEntity: 'App.Department', properties: { variable: 'Department', members: [{ attribute: 'App.Department.Name', value: "'x'" }] } });
+const createCopy = () => mfStep('CreateAction', { targetEntity: 'App.Copy', properties: { outputVariable: 'NewCopy', members: [{ attribute: 'App.Copy.Name', value: "'x'" }] } });
+
+describe('SEC-MF-008 — module role can run the microflow but lacks entity access', () => {
+  const only = (ir) => evaluate('SEC-MF-008', ir);
+
+  it('reports the read-only module role on a change and the module role with no rule on a create', () => {
+    const [finding] = only(saveIr([changeName(), createCopy()]));
+    assert.equal(finding.severity, 'Critical');
+    assert.match(finding.observation, /module role App\.HR \(user role HR\) cannot write App\.Department\.Name \(read only\); create App\.Copy \(no access rule for this role\)/);
+  });
+
+  it('judges a rule with an XPath constraint by its access rights alone', () => {
+    // Admin's rule has [System.owner=…] and Read/Write on Name: Admin may write Name.
+    const [finding] = only(saveIr([changeName()]));
+    assert.doesNotMatch(finding.observation, /App\.Admin/);
+    assert.doesNotMatch(finding.observation, /App\.User/);
+    assert.doesNotMatch(finding.observation, /XPath/);
+  });
+
+  it('reports a rule with an XPath constraint whose access rights are read only', () => {
+    const ir = saveIr([changeName()]);
+    const adminRule = ir.entities['App.Department'].accessRules[0];
+    adminRule.memberAccess = [{ attributeOrAssociation: 'App.Department.Name', isAssociation: false, access: 'ReadOnly' }];
+    const [finding] = only(ir);
+    assert.match(finding.observation, /module role App\.Admin \(user role Administrator\) cannot write App\.Department\.Name \(read only\)/);
+  });
+
+  it('counts an XPath rule for an object the microflow creates itself', () => {
+    const create = mfStep('CreateAction', { targetEntity: 'App.Department', properties: { outputVariable: 'NewDepartment', members: [{ attribute: 'App.Department.Name', value: "'x'" }] } });
+    const change = mfStep('ChangeAction', { targetEntity: 'App.Department', properties: { variable: 'NewDepartment', members: [{ attribute: 'App.Department.Name', value: "'y'" }] } });
+    const findings = only(saveIr([create, change]));
+    assert.doesNotMatch(findings[0]?.observation ?? '', /App\.Admin/);
+  });
+
+  it('checks delete against "Delete objects" in the access rights', () => {
+    const remove = () => mfStep('DeleteAction', { targetEntity: 'App.Department', properties: { variable: 'Department' } });
+    const [finding] = only(saveIr([remove()]));
+    assert.doesNotMatch(finding.observation, /App\.Admin/);
+    assert.match(finding.observation, /module role App\.User \(user role Initiator\) cannot delete App\.Department \("Delete objects" is off\)/);
+  });
+
+  it('reports a retrieve with no read rule as Medium', () => {
+    const [finding] = only(saveIr([mfStep('RetrieveAction', { targetEntity: 'App.Copy', properties: { retrieveSource: 'database' } })]));
+    assert.equal(finding.severity, 'Medium');
+    assert.match(finding.observation, /module role App\.HR \(user role HR\) cannot retrieve App\.Copy \(no access rule, so the retrieve returns nothing\)/);
+  });
+
+  it('skips microflows without "Apply entity access"', () => {
+    const ir = saveIr([changeName()]);
+    ir.microflows['App.ACT_Save'].appliesEntityAccess = false;
+    assert.deepEqual(only(ir), []);
+  });
+
+  it('skips non-persistable entities', () => {
+    assert.deepEqual(only(saveIr([mfStep('CreateAction', { targetEntity: 'App.Draft', properties: { outputVariable: 'Draft' } })])), []);
+  });
+
+  it('checks a sub-microflow with the module roles of its caller', () => {
+    const ir = saveIr([mfStep('MicroflowCall', { properties: { callee: 'App.SUB_Copy' } })], {
+      microflows: [microflow('App.SUB_Copy', { appliesEntityAccess: true, activities: [createCopy()] })],
+    });
+    const findings = only(ir);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].evidence.objectName, 'SUB_Copy');
+    assert.match(findings[0].observation, /module role App\.HR \(user role HR\) cannot create App\.Copy.*called from App\.ACT_Save/);
+  });
+
+  it('judges each module role by its own rules, even when a user role also holds a stronger role of the same module', () => {
+    // One user role holds both Manager and Initiator; Manager may still only write Status.
+    const ir = requestIr([userRole('Lead', ['App.Manager', 'App.Initiator'])]);
+    const [finding] = only(ir);
+    assert.match(finding.observation, /module role App\.Manager \(user role Lead\) cannot write App\.Request\.EmployeeName \(read only\)/);
+    assert.doesNotMatch(finding.observation, /App\.Initiator/);
+    assert.doesNotMatch(finding.observation, /write App\.Request\.Status/);
+  });
+
+  it('reports Manager (write on Status only) and HR (read only) on a save that changes status and personal data', () => {
+    const [finding] = only(requestIr());
+    assert.match(finding.observation, /module role App\.Manager \(user role Manager\) cannot write App\.Request\.EmployeeName \(read only\)/);
+    assert.match(finding.observation, /module role App\.HR \(user role HR\) cannot write App\.Request\.Status \(read only\); write App\.Request\.EmployeeName \(read only\)/);
+    assert.doesNotMatch(finding.observation, /App\.Initiator/);
+  });
+
+  it('uses the roles of another module that every holder has, for an entity in that module', () => {
+    const ir = requestIr();
+    ir.entities['Files.Document'] = entity('Files.Document', {
+      accessRules: [accessRule(['Files.User'], { allowCreate: true, memberAccess: [{ attributeOrAssociation: 'Files.Document.Name', isAssociation: false, access: 'ReadWrite' }] })],
+    });
+    ir.security.userRoles = ir.security.userRoles.map((u) => ({ ...u, moduleRoles: [...u.moduleRoles, { module: 'Files', role: 'User' }] }));
+    ir.microflows['App.ACT_Save'].activities = [mfStep('CreateAction', { targetEntity: 'Files.Document', properties: { outputVariable: 'Doc', members: [{ attribute: 'Files.Document.Name', value: "'x'" }] } })];
+    assert.deepEqual(only(ir), []);
+  });
+});
+
+/**
+ * The request scenario: Initiator may create, delete and write everything, Manager may write only
+ * Status, HR may only read. ACT_Save applies entity access, is allowed for all three, and changes
+ * Status and EmployeeName (copied from an account parameter).
+ */
+function requestIr(userRoles) {
+  const member = (name, access) => ({ attributeOrAssociation: `App.Request.${name}`, isAssociation: false, access });
+  return makeIr({
+    entities: byQualifiedName([
+      entity('App.Request', {
+        accessRules: [
+          accessRule(['App.Initiator'], { allowCreate: true, allowDelete: true, memberAccess: [member('Status', 'ReadWrite'), member('EmployeeName', 'ReadWrite')] }),
+          accessRule(['App.Manager'], { memberAccess: [member('Status', 'ReadWrite'), member('EmployeeName', 'ReadOnly')] }),
+          accessRule(['App.HR'], { memberAccess: [member('Status', 'ReadOnly'), member('EmployeeName', 'ReadOnly')] }),
+        ],
+      }),
+    ]),
+    security: {
+      userRoles: userRoles ?? [userRole('Initiator', ['App.Initiator']), userRole('Manager', ['App.Manager']), userRole('HR', ['App.HR'])],
+      moduleRoles: [moduleRole('App.Initiator'), moduleRole('App.Manager'), moduleRole('App.HR')],
+    },
+    microflows: byQualifiedName([
+      microflow('App.ACT_Save', {
+        appliesEntityAccess: true,
+        allowedRoles: userRoles ? ['App.Manager'] : ['App.Initiator', 'App.Manager', 'App.HR'],
+        activities: [
+          mfStep('ChangeAction', {
+            targetEntity: 'App.Request',
+            properties: {
+              variable: 'Request',
+              members: [
+                { attribute: 'App.Request.Status', value: 'App.Status.Approved' },
+                { attribute: 'App.Request.EmployeeName', value: '$Account/FullName' },
+              ],
+            },
+          }),
+        ],
+      }),
+    ]),
+  });
+}
+
+/**
+ * SEC-005 with the writes followed: App.Client.ApiSecret (String) and an action App.Protect whose
+ * code encrypts. `activities` is the body of App.ACT_Store.
+ */
+function secretIr(activities, extra = {}) {
+  return makeIr({
+    entities: byQualifiedName([
+      entity('App.Client', { attributes: [attribute('ApiSecret', 'String', { isSensitive: true, sensitivityTerm: 'secret' })] }),
+    ]),
+    microflows: byQualifiedName([microflow('App.ACT_Store', { activities })]),
+    customCode: {
+      javaActions: [
+        { name: 'Protect', module: 'App', usesExternalLibraries: [], encrypts: true },
+        { name: 'Reveal', module: 'App', usesExternalLibraries: [], encrypts: false },
+      ],
+    },
+    ...extra,
+  });
+}
+const SECRET = 'App.Client.ApiSecret';
+const createClient = (value, commit = 'No') =>
+  mfStep('CreateAction', { targetEntity: 'App.Client', properties: { outputVariable: 'Client', commit, members: [{ attribute: SECRET, value }] } });
+const callAction = (callee, output = 'Result') => mfStep('JavaActionCall', { properties: { callee, outputVariable: output } });
+const changeClient = (value, commit = 'Yes') =>
+  mfStep('ChangeAction', { targetEntity: 'App.Client', properties: { variable: 'Client', commit, members: [{ attribute: SECRET, value }] } });
+
+describe('SEC-005 — follows where a secret attribute is written', () => {
+  const only = (ir) => evaluate('SEC-005', ir);
+
+  it('passes when every write stores the result of an action whose code encrypts', () => {
+    assert.deepEqual(only(secretIr([callAction('App.Protect'), createClient('$Result', 'Yes')])), []);
+  });
+
+  it('passes when a plain value is replaced by the encrypted one before the object is committed', () => {
+    assert.deepEqual(only(secretIr([createClient('$Input/Secret'), callAction('App.Protect'), changeClient('$Result')])), []);
+  });
+
+  it('fails when the plain value is committed before it is replaced', () => {
+    const [finding] = only(secretIr([createClient('$Input/Secret', 'Yes'), callAction('App.Protect'), changeClient('$Result')]));
+    assert.equal(finding.status, 'FAIL');
+    assert.match(finding.observation, /encrypted before it is stored in Change object in App\.ACT_Store, but written as plain text in Create object in App\.ACT_Store/);
+  });
+
+  it('fails when the action does not encrypt', () => {
+    const [finding] = only(secretIr([callAction('App.Reveal'), createClient('$Result', 'Yes')]));
+    assert.equal(finding.severity, 'High');
+    assert.match(finding.observation, /no microflow writes it through a Java action that encrypts .*written as plain text in Create object in App\.ACT_Store/);
+  });
+
+  it('asks for review when a page also refers to the attribute', () => {
+    const ir = secretIr([callAction('App.Protect'), createClient('$Result', 'Yes')], {
+      pages: byQualifiedName([page('App.Client_Edit', { references: ['App.Client', SECRET] })]),
+    });
+    const [finding] = only(ir);
+    assert.equal(finding.status, 'WARNING');
+    assert.equal(finding.severity, 'Medium');
+    assert.match(finding.observation, /Page App\.Client_Edit also refers to it/);
+    assert.match(finding.recommendation, /saves through the microflow that encrypts it/);
+  });
+
+  it('follows a sub-microflow that returns the encrypted value', () => {
+    const ir = secretIr([mfStep('MicroflowCall', { properties: { callee: 'App.SUB_Protect', outputVariable: 'Sealed' } }), createClient('$Sealed', 'Yes')]);
+    ir.microflows['App.SUB_Protect'] = microflow('App.SUB_Protect', { activities: [callAction('App.Protect', 'Out')], returnValues: ['$Out'] });
+    assert.deepEqual(only(ir), []);
+  });
+
+  it('fails when the sub-microflow returns a plain value', () => {
+    const ir = secretIr([mfStep('MicroflowCall', { properties: { callee: 'App.SUB_Plain', outputVariable: 'Sealed' } }), createClient('$Sealed', 'Yes')]);
+    ir.microflows['App.SUB_Plain'] = microflow('App.SUB_Plain', { activities: [callAction('App.Protect', 'Out')], returnValues: ['$Input'] });
+    assert.equal(only(ir)[0].status, 'FAIL');
+  });
+
+  it('follows the encrypted value through Create and Change variable', () => {
+    const steps = [
+      callAction('App.Protect'),
+      mfStep('CreateVariable', { properties: { outputVariable: 'Copy', value: '$Result' } }),
+      mfStep('ChangeVariable', { properties: { variable: 'Final', value: '$Copy' } }),
+      createClient('$Final', 'Yes'),
+    ];
+    // Final is changed from Copy, so it holds the encrypted value.
+    assert.deepEqual(only(secretIr(steps)), []);
+  });
+
+  it('forgets the encrypted value when a variable is changed to something else', () => {
+    const steps = [callAction('App.Protect'), mfStep('ChangeVariable', { properties: { variable: 'Result', value: "'other'" } }), createClient('$Result', 'Yes')];
+    assert.equal(only(secretIr(steps))[0].status, 'FAIL');
+  });
+
+  it('does not loop on a sub-microflow that calls itself', () => {
+    const ir = secretIr([mfStep('MicroflowCall', { properties: { callee: 'App.SUB_Loop', outputVariable: 'X' } }), createClient('$X', 'Yes')]);
+    ir.microflows['App.SUB_Loop'] = microflow('App.SUB_Loop', {
+      activities: [mfStep('MicroflowCall', { properties: { callee: 'App.SUB_Loop', outputVariable: 'Y' } })],
+      returnValues: ['$Y'],
+    });
+    assert.equal(only(ir)[0].status, 'FAIL');
+  });
+
+  it('asks for review when a plain value is typed into the model, even if it is replaced', () => {
+    const [finding] = only(secretIr([createClient("'s3cr3t'"), callAction('App.Protect'), changeClient('$Result')]));
+    assert.equal(finding.status, 'WARNING');
+    assert.match(finding.observation, /A plain value for it is typed into the model in Create object in App\.ACT_Store/);
+    assert.deepEqual(finding.evidence.details.typedIntoModel, ['Create object in App.ACT_Store']);
+  });
+});
+
+/** An activity with custom error handling and the given error flow. */
+function handled(type, errorPath) {
+  return mfStep(type, { properties: { errorHandlingType: 'CustomWithoutRollBack', errorPath } });
+}
+
+function flowIr(microflows) {
+  return makeIr({ microflows: byQualifiedName(microflows) });
+}
+
+describe('SEC-MF-006 — grading and background execution', () => {
+  const only = (ir) => evaluate('SEC-MF-006', ir);
+
+  it('grades no error handling High and a missing log Medium, one finding per microflow', () => {
+    const findings = only(
+      flowIr([
+        microflow('App.ACT_A', { activities: [mfStep('RestCall', { properties: { errorHandlingType: 'Rollback' } }), handled('ImportMapping', { logs: false, calls: [] })] }),
+        microflow('App.ACT_B', { activities: [handled('WebServiceCall', { logs: false, calls: [] })] }),
+      ])
+    );
+    const bySubject = Object.fromEntries(findings.map((f) => [f.evidence.objectName, f]));
+    assert.equal(findings.length, 2);
+    assert.equal(bySubject.ACT_A.severity, 'High');
+    assert.match(bySubject.ACT_A.observation, /no custom error handling/);
+    assert.match(bySubject.ACT_A.observation, /no Log message/);
+    assert.equal(bySubject.ACT_B.severity, 'Medium');
+  });
+
+  it('treats "Custom" (with rollback) as custom handling', () => {
+    const findings = only(flowIr([microflow('App.ACT_A', { activities: [mfStep('RestCall', { properties: { errorHandlingType: 'Custom', errorPath: { logs: true, calls: [] } } })] })]));
+    assert.deepEqual(findings, []);
+  });
+
+  it('reports custom handling that has no error flow at all', () => {
+    const findings = only(flowIr([microflow('App.ACT_A', { activities: [mfStep('RestCall', { properties: { errorHandlingType: 'Custom' } })] })]));
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].severity, 'Medium');
+  });
+
+  it('checks a Call ML model activity', () => {
+    const findings = only(flowIr([microflow('App.ACT_Predict', { activities: [mfStep('MLModelCall', { properties: { errorHandlingType: 'Rollback', callee: 'App.ChurnModel' } })] })]));
+    assert.equal(findings.length, 1);
+    assert.match(findings[0].observation, /Call ML model App\.ChurnModel/);
+  });
+
+  it('checks a Call workflow activity', () => {
+    const findings = only(flowIr([microflow('App.ACT_Start', { activities: [mfStep('WorkflowCall', { properties: { errorHandlingType: 'Rollback', callee: 'App.Approval' } })] })]));
+    assert.equal(findings.length, 1);
+    assert.match(findings[0].observation, /Call workflow App.Approval/);
+  });
+
+  it('names an activity by its caption and endpoint, whatever it was renamed to', () => {
+    const findings = only(
+      flowIr([
+        microflow('App.ACT_Send', {
+          activities: [
+            mfStep('RestCall', {
+              properties: { errorHandlingType: 'Rollback', caption: 'Fetch orders', endpoint: 'GET $Config/Url', mapping: 'App.ImportOrders' },
+            }),
+          ],
+        }),
+      ])
+    );
+    assert.match(findings[0].observation, /Call REST service "Fetch orders" \(GET \$Config\/Url, mapping App\.ImportOrders\)/);
+  });
+
+  it('checks every Java action in your own modules', () => {
+    const findings = only(flowIr([microflow('App.ACT_Trim', { activities: [mfStep('JavaActionCall', { properties: { errorHandlingType: 'Rollback', callee: 'Market.Trim' } })] })]));
+    assert.equal(findings.length, 1);
+    assert.match(findings[0].observation, /Java action Market\.Trim/);
+  });
+
+  it('checks Marketplace Java actions reached from a scheduled event, as Review one level lower', () => {
+    const findings = only(
+      flowIr([
+        microflow('Market.SE_Sync', {
+          referencedBy: [{ qualifiedName: 'Market.Sync', kind: 'ScheduledEvent' }],
+          activities: [mfStep('MicroflowCall', { properties: { callee: 'Market.SUB_Fetch' } })],
+        }),
+        microflow('Market.SUB_Fetch', { activities: [mfStep('JavaActionCall', { properties: { errorHandlingType: 'Rollback', callee: 'Market.Fetch' } })] }),
+      ])
+    );
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].status, 'WARNING');
+    assert.equal(findings[0].severity, 'Medium');
+    assert.match(findings[0].observation, /called from Market\.SE_Sync, started by scheduled event Market\.Sync/);
+  });
+
+  it('checks Marketplace Java actions in a microflow called in a task queue', () => {
+    const findings = only(
+      flowIr([
+        microflow('App.ACT_Start', { activities: [mfStep('MicroflowCall', { properties: { callee: 'Market.QUEUE_Run', queued: true } })] }),
+        microflow('Market.QUEUE_Run', { activities: [mfStep('JavaActionCall', { properties: { errorHandlingType: 'Rollback', callee: 'Market.Run' } })] }),
+      ])
+    );
+    assert.equal(findings.length, 1);
+    assert.match(findings[0].observation, /task queue from App\.ACT_Start/);
+  });
+
+  it('checks Marketplace Java actions started by a workflow', () => {
+    const findings = only(
+      flowIr([
+        microflow('Market.WF_Step', {
+          referencedBy: [{ qualifiedName: 'Market.Approval', kind: 'Workflow' }],
+          activities: [mfStep('JavaActionCall', { properties: { errorHandlingType: 'Rollback', callee: 'Market.Run' } })],
+        }),
+      ])
+    );
+    assert.equal(findings.length, 1);
+  });
+});
 
 /** An activity as the snapshot extractor normalises it. */
 function mfStep(type, extra = {}) {
@@ -1048,8 +1515,8 @@ describe('SEC rule catalogue: firing and quiet cases', () => {
 describe('SEC rule catalogue: catalogue-wide invariants', () => {
   const secRules = [...RULES.values()].filter((r) => r.id.startsWith('SEC-'));
 
-  it('covers all 35 rules, each with a firing and a quiet case', () => {
-    assert.equal(secRules.length, 35);
+  it('covers all 36 rules, each with a firing and a quiet case', () => {
+    assert.equal(secRules.length, 36);
     const tested = new Set(CASES.map((c) => c.id));
     const untested = secRules.map((r) => r.id).filter((id) => !tested.has(id));
     assert.deepEqual(untested, []);
@@ -1064,10 +1531,7 @@ describe('SEC rule catalogue: catalogue-wide invariants', () => {
   it('declares the facts each rule depends on', () => {
     for (const rule of secRules) {
       assert.ok(Array.isArray(rule.requires), `${rule.id} has no requires array`);
-      // SEC-007 legitimately needs nothing from the model: it reads custom code on disk.
-      if (rule.id !== 'SEC-007') {
-        assert.ok(rule.requires.length > 0, `${rule.id} declares no required facts`);
-      }
+      assert.ok(rule.requires.length > 0, `${rule.id} declares no required facts`);
     }
   });
 
@@ -1224,5 +1688,113 @@ describe('SEC-MF-003: a non-persistable parameter counts only when its values re
       ]).length,
       0
     );
+  });
+});
+
+describe('SEC-005: the advice follows what the value is used for', () => {
+  const sec005 = RULES.get('SEC-005');
+  const run = (name, term) =>
+    sec005.evaluate(
+      makeIr({
+        entities: byQualifiedName([entity('App.Account', { attributes: [attribute(name, 'String', { isSensitive: true, sensitivityTerm: term })] })]),
+      })
+    )[0];
+
+  it('a password the app only verifies: hash it first', () => {
+    const f = run('Password', 'password');
+    assert.match(f.recommendation, /change its type to HashedString/);
+    assert.equal(f.evidence.details.suggested, 'HashedString');
+  });
+
+  it('a token the app sends on: encrypt it with the Encryption module, never hash it', () => {
+    const f = run('Access_token', 'token');
+    assert.match(f.recommendation, /EncryptString \(Encryption module\)/);
+    assert.match(f.recommendation, /DecryptString/);
+    assert.equal(f.evidence.details.suggested, 'encrypt with the Encryption module');
+  });
+
+  it('the rule text explains both options', () => {
+    assert.match(sec005.expectedPractice, /HashedString/);
+    assert.match(sec005.expectedPractice, /EncryptString/);
+    assert.match(sec005.whyItMatters, /cannot be read back/);
+    assert.equal(sec005.name, 'Password or secret attribute stored as plain text');
+  });
+});
+
+describe('SEC-028 and SEC-MF-001: one finding per problem, graded by what the microflow does', () => {
+  const sec028 = RULES.get('SEC-028');
+  const mf001 = RULES.get('SEC-MF-001');
+  const order = entity('App.Order');
+  const fromPage = [{ kind: 'Page', qualifiedName: 'App.Order_Overview' }];
+  const ir = (mf, extra = {}) =>
+    makeIr({ entities: byQualifiedName([order]), microflows: byQualifiedName([mf]), ...extra });
+  const flow = (extra) => microflow('App.ACT_Order', { appliesEntityAccess: false, allowedRoles: ['App.User'], referencedBy: [], ...extra });
+  const writes = [mfStep('ChangeAction', { targetEntity: 'App.Order' })];
+  const reads = [mfStep('RetrieveAction', { targetEntity: 'App.Order', properties: { retrieveSource: 'database' } })];
+  const calls = [mfStep('MicroflowCall', { properties: { callee: 'App.SUB_Order' } })];
+
+  it('a microflow a page starts is reported by SEC-MF-001 only, not twice', () => {
+    const subject = ir(flow({ referencedBy: fromPage, activities: writes }));
+    assert.equal(mf001.evaluate(subject).length, 1);
+    assert.equal(sec028.evaluate(subject).length, 0);
+  });
+
+  it('SEC-028 keeps the ones SEC-MF-001 does not report', () => {
+    // No page starts it, but a role can still call it from the browser.
+    assert.equal(sec028.evaluate(ir(flow({ activities: writes }))).length, 1);
+    // A page starts it, but only administrators may call it: SEC-MF-001 skips it, so SEC-028 keeps it.
+    assert.equal(sec028.evaluate(ir(flow({ allowedRoles: ['App.Administrator'], referencedBy: fromPage, activities: writes }))).length, 1);
+    // Where-used was not read: never assume "no page starts it" from missing data.
+    assert.equal(sec028.evaluate(ir(flow({ referencedBy: undefined, activities: writes }))).length, 1);
+  });
+
+  it('SEC-MF-001 grades by data access: writes Critical, reads High, calls Medium, nothing Low', () => {
+    const grade = (activities) => {
+      const [f] = mf001.evaluate(ir(flow({ referencedBy: fromPage, activities })));
+      return `${f.status} ${f.severity}`;
+    };
+    assert.equal(grade(writes), 'FAIL Critical');
+    assert.equal(grade(reads), 'FAIL High');
+    assert.equal(grade(calls), 'WARNING Medium');
+    assert.equal(grade([]), 'WARNING Low');
+  });
+
+  it('SEC-028 grades by data access: writes High, reads Medium, calls or nothing Low', () => {
+    const grade = (activities) => {
+      const [f] = sec028.evaluate(ir(flow({ activities })));
+      return `${f.status} ${f.severity}`;
+    };
+    assert.equal(grade(writes), 'FAIL High');
+    assert.equal(grade(reads), 'FAIL Medium');
+    assert.equal(grade(calls), 'WARNING Low');
+    assert.equal(grade([]), 'WARNING Low');
+  });
+
+  it('a write to a non-persistable helper is not stored data', () => {
+    const helper = entity('App.Form', { persistenceType: 'non-persistable' });
+    const subject = makeIr({
+      entities: byQualifiedName([helper]),
+      microflows: byQualifiedName([flow({ activities: [mfStep('ChangeAction', { targetEntity: 'App.Form' })] })]),
+    });
+    assert.equal(sec028.evaluate(subject)[0].evidence.details.dataAccess, 'none');
+  });
+
+  it('one level higher when the anonymous role can call it', () => {
+    const security = withGuest({}, ['App.User']);
+    assert.equal(sec028.evaluate(ir(flow({ activities: reads }), { security }))[0].severity, 'High');
+    assert.equal(mf001.evaluate(ir(flow({ referencedBy: fromPage, activities: reads }), { security }))[0].severity, 'Critical');
+  });
+
+  it('says in plain words what the microflow does', () => {
+    const [f] = mf001.evaluate(ir(flow({ referencedBy: fromPage, activities: writes })));
+    assert.match(f.observation, /is started from page App\.Order_Overview/);
+    assert.match(f.observation, /writes stored data \(change App\.Order\)/);
+  });
+
+  it('without microflow contents the previous grading is kept', () => {
+    const subject = ir(flow({ activities: [] }), { coverage: { microflowActivities: 'NOT_ANALYZABLE' } });
+    const [f] = sec028.evaluate(subject);
+    assert.equal(`${f.status} ${f.severity}`, 'FAIL High');
+    assert.equal(f.evidence.details.dataAccess, 'not read');
   });
 });

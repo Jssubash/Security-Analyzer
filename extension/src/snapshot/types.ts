@@ -140,6 +140,8 @@ export interface ModelSnapshot {
     directory?: string;
     /** Studio Pro version hosting the extension, e.g. `10.24.0.73019`. */
     studioProVersion?: string;
+    /** The app's Java version from its runtime settings, e.g. `Java21`. Absent from older hosts. */
+    javaVersion?: string;
   };
   /** Project-level units: `Security$ProjectSecurity`, `Navigation$NavigationDocument`. */
   projectUnits: SnapshotNode[];
@@ -159,6 +161,11 @@ export interface ModelSnapshot {
    * events, workflows, published services, project settings. Absent from hosts that predate it.
    */
   referenceIndex?: { referrer: string; kind: string; references: string[] }[];
+  /**
+   * Each pluggable widget id placed in the app, with the pages, snippets and layouts that place it.
+   * Absent from hosts that predate it, which leaves widget usage unknown.
+   */
+  widgetUsage?: Record<string, string[]>;
   /** What the host saw, for troubleshooting a snapshot that reads less than expected. */
   diagnostics?: {
     /** Every unit type found under a module, with a count. */

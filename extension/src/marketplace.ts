@@ -37,6 +37,11 @@ export interface MarketplaceItem {
   bundledWith?: string;
   /** For a widget shipped inside a module: the module's installed version, which is what updates. */
   moduleVersion?: string;
+  /**
+   * Widgets: the namespace its widget ids share (`vendor.widget.native.barchart.BarChart` →
+   * `vendor.widget.native`). Widgets with the same namespace are shown as one family.
+   */
+  family?: string;
   isThemeModule?: boolean;
   /** Widget packages: the widget ids inside, and the platforms they target. */
   widgetIds: string[];
@@ -48,6 +53,11 @@ export interface MarketplaceItem {
    * separately and do not count towards a widget being vulnerable.
    */
   dependencies: { name: string; version: string; transitive?: boolean }[];
+  /**
+   * Widgets: the pages, snippets and layouts that place any of its widget ids. Empty when the app
+   * places none of them; `undefined` when the snapshot does not say (an older host).
+   */
+  usedIn?: string[];
 }
 
 export interface UpgradeInventory {
@@ -59,12 +69,6 @@ export interface UpgradeInventory {
   scanned: boolean;
   notes: string[];
 }
-
-/** Widgets of the Data Widgets module, by widget id. */
-const DATA_WIDGETS = new Set(
-  ['datagrid', 'datagriddatefilter', 'datagriddropdownfilter', 'datagridnumberfilter', 'datagridtextfilter', 'dropdownsort', 'gallery', 'selectionhelper', 'treenode', 'tree-node']
-    .map((w) => `com.mendix.widget.web.${w}.`)
-);
 
 const normalise = (s: string | null | undefined) => (s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -97,8 +101,14 @@ export function buildUpgradeInventory(snapshot: ModelSnapshot): UpgradeInventory
   }
 
   const byName = new Map(modules.map((m) => [normalise(m.name), m]));
+  // Widget ids are matched without case: a package's XML and the page model spell them alike in
+  // practice, but nothing requires it.
+  const usage = snapshot.widgetUsage
+    ? new Map(Object.entries(snapshot.widgetUsage).map(([id, docs]) => [id.toLowerCase(), docs]))
+    : undefined;
   const widgets: MarketplaceItem[] = (snapshot.widgets?.packages ?? []).map((p) => {
     const ids = (p.widgets ?? []).map((w) => w.id);
+    const usedIn = usage ? [...new Set(ids.flatMap((id) => usage.get(id.toLowerCase()) ?? []))].sort() : undefined;
     const platforms = [...new Set((p.widgets ?? []).map((w) => w.supportedPlatform || 'Web'))];
     const item: MarketplaceItem = {
       key: `widget:${p.fileName}`,
@@ -110,6 +120,8 @@ export function buildUpgradeInventory(snapshot: ModelSnapshot): UpgradeInventory
       platforms,
       fileName: p.fileName,
       dependencies: p.dependencies ?? [],
+      usedIn,
+      family: widgetFamily(ids),
     };
     const owner = bundlingModule(p.name ?? undefined, p.version ?? undefined, ids, byName);
     if (owner) {
@@ -133,21 +145,33 @@ export function buildUpgradeInventory(snapshot: ModelSnapshot): UpgradeInventory
 }
 
 /** The installed module a widget package ships with, if it is one of a module's own widgets. */
+/**
+ * The namespace a package's widget ids share: the id without its widget name and, when it repeats
+ * that name, the package segment (`vendor.widget.native.barchart.BarChart` → `vendor.widget.native`).
+ * Read from the package itself, so it works for any vendor's widgets.
+ */
+function widgetFamily(ids: string[]): string | undefined {
+  const spaces = ids.map((id) => {
+    const parts = id.split('.');
+    const name = parts.pop() ?? '';
+    if (parts.length > 0 && parts[parts.length - 1]!.toLowerCase() === name.toLowerCase()) parts.pop();
+    return parts.join('.');
+  });
+  const first = spaces[0];
+  return first && spaces.every((s) => s === first) ? first : undefined;
+}
+
+/**
+ * The module that installed a widget, when the model shows it: a Marketplace module of the same
+ * name at the same version (module X 2.2.1 → widget X 2.2.1). Mendix records no other link between
+ * a module and the widget packages its import wrote, so nothing else is assumed.
+ */
 function bundlingModule(
   packageName: string | undefined,
   version: string | undefined,
-  ids: string[],
+  _ids: string[],
   modules: Map<string, MarketplaceItem>
 ): MarketplaceItem | undefined {
-  if (ids.some((id) => id.toLowerCase().startsWith('com.mendix.widget.native.'))) {
-    const native = modules.get('nativemobileresources');
-    if (native) return native;
-  }
-  if (ids.some((id) => [...DATA_WIDGETS].some((prefix) => id.toLowerCase().startsWith(prefix)))) {
-    const dw = modules.get('datawidgets');
-    if (dw) return dw;
-  }
-  // A module that ships a widget of its own name at its own version (FileUploader 2.2.1 → FileUploader widget 2.2.1).
   const same = modules.get(normalise(packageName));
   if (same && version && same.installedVersion === version) return same;
   return undefined;
@@ -187,9 +211,8 @@ export function contentIdsToCheck(inventory: UpgradeInventory, widgetMatches: Re
 }
 
 /**
- * Widgets that ship on their own, matched to catalog widgets by name. A Mendix-built widget
- * (`com.mendix.widget.*`) prefers a Mendix-published entry; a name that still matches more than
- * one entry is left unmatched rather than guessed.
+ * Widgets that ship on their own, matched to catalog widgets by name. A name that matches more
+ * than one entry is left unmatched rather than guessed.
  */
 export function matchWidgets(inventory: UpgradeInventory, catalog: CatalogEntry[]): Record<string, number> {
   const widgets = catalog.filter((c) => /widget/i.test(c.type ?? ''));
@@ -206,10 +229,6 @@ export function matchWidgets(inventory: UpgradeInventory, catalog: CatalogEntry[
     for (const n of names) {
       candidates = index.get(normalise(n)) ?? [];
       if (candidates.length > 0) break;
-    }
-    if (candidates.length > 1 && w.widgetIds.some((id) => id.startsWith('com.mendix.'))) {
-      const byMendix = candidates.filter((c) => /mendix/i.test(c.publisher ?? ''));
-      if (byMendix.length > 0) candidates = byMendix;
     }
     if (candidates.length === 1) matches[w.key] = candidates[0]!.contentId;
   }
@@ -244,6 +263,10 @@ const majorOf = (v: string | undefined) => (v ? Number(v.split('.')[0]) : NaN);
 /** At or below: `minSupportedMendixVersion` 10.24.0 suits a 10.24.3 app. */
 const supports = (v: MarketplaceVersion, target: string) => !v.minSupportedMendixVersion || compareVersions(v.minSupportedMendixVersion, target) <= 0;
 
+/** What is known about a widget the Marketplace does not list under its own name. */
+const NOT_ON_ITS_OWN =
+  'Not on the Marketplace on its own: probably installed by a Marketplace module (update the module that installed it to update this widget), or a custom or private widget (check it with its author).';
+
 export function assessItem(item: MarketplaceItem, versions: MarketplaceVersion[] | undefined, target: string | undefined): ItemAssessment {
   if (!item.contentId) {
     return {
@@ -251,7 +274,7 @@ export function assessItem(item: MarketplaceItem, versions: MarketplaceVersion[]
       note:
         item.kind === 'module'
           ? 'The model records no Marketplace content id for this module (installed by hand, or by a very old Studio Pro).'
-          : 'Not found on the Marketplace by name — a custom, private or renamed widget. Check it with its author.',
+          : NOT_ON_ITS_OWN,
     };
   }
   if (!versions) return { status: 'not-checked', note: 'Not checked against the Marketplace yet.' };
@@ -262,6 +285,20 @@ export function assessItem(item: MarketplaceItem, versions: MarketplaceVersion[]
 
   const sorted = [...versions].sort((a, b) => compareVersions(b.versionNumber, a.versionNumber));
   const latest = sorted[0];
+  // A widget matched by name whose every Marketplace release is older than the installed one, and
+  // none equal to it, is a different item that happens to share the name.
+  if (
+    item.kind === 'widget' &&
+    item.installedVersion &&
+    latest &&
+    !sorted.some((v) => v.versionNumber === item.installedVersion) &&
+    compareVersions(latest.versionNumber, item.installedVersion) < 0
+  ) {
+    return {
+      status: 'not-found',
+      note: `The Marketplace item with this name stops at ${latest.versionNumber}, below the installed ${item.installedVersion}, so it is a different item. ${NOT_ON_ITS_OWN}`,
+    };
+  }
   const recommended = sorted.find((v) => supports(v, target));
   const installed = item.installedVersion ? sorted.find((v) => v.versionNumber === item.installedVersion) : undefined;
   const needs = (v: MarketplaceVersion | undefined) => (v?.minSupportedMendixVersion ? ` (needs Mendix ${v.minSupportedMendixVersion})` : '');
@@ -344,8 +381,6 @@ export function assessWidget(widget: MarketplaceItem, own: ItemAssessment, owner
   };
 }
 
-/** Mendix versions offered in the planner, after the app's own. */
-export const PLANNING_TARGETS = ['9.24.0', '10.6.0', '10.12.0', '10.18.0', '10.24.0', '11.0.0', '11.6.0', '11.12.0'];
 
 export function isMendixVersion(value: string): boolean {
   return /^\d+\.\d+(\.\d+)?$/.test(value.trim());
@@ -444,10 +479,11 @@ export function widgetSecurityAdvice(
   const latest = assessment.latest;
   const confirm = 'Confirm in its release notes that it ships the fixed library version.';
 
+
   if (assessment.status === 'not-checked' || assessment.status === 'not-found' || !rec) {
     return `The vulnerable code is in ${libs}, bundled into this widget. ${
       assessment.status === 'not-found'
-        ? 'The widget could not be found on the Marketplace: ask its author for a release with a fixed copy, or replace the widget.'
+        ? 'The widget is not on the Marketplace on its own. If a Marketplace module installed it, a newer release of that module is the fix; otherwise ask its author for a release with a fixed copy, or replace the widget. Delete the package if the app does not use it.'
         : 'Check the Marketplace (above) to find the release to move to for ' + forTarget + '.'
     }`;
   }

@@ -41,19 +41,20 @@ const EXPECTED = [
   'SEC-020-MyFirstModule.RequestForm.Email#1 | FAIL | High',
   'SEC-020-MyFirstModule.RequestForm.Name#1 | FAIL | High',
   'SEC-020-MyFirstModule.RequestForm.PhoneNumber#1 | FAIL | High',
-  'SEC-021-MyFirstModule.RequestForm.Email#1 | FAIL | High',
-  'SEC-021-MyFirstModule.RequestForm.PhoneNumber#1 | FAIL | High',
-  'SEC-028-Atlas_Core.DS_Account_CurrentUser | WARNING | High',
+  // SEC-028 leaves DS_Account_CurrentUser to SEC-MF-001: a page starts it, so it is reported once.
   'SEC-029-MyFirstModule.RequestForm#1 | FAIL | High',
   // SEC-MF rules read microflow bodies and the reference index, which only the extension extracts.
-  'SEC-MF-001-Administration.ShowMyPasswordForm | WARNING | High',
+  // Graded by data access: it only opens a page and touches no stored data (Low, Marketplace).
+  'SEC-MF-001-Administration.ShowMyPasswordForm | WARNING | Low',
   'SEC-MF-001-Atlas_Core.DS_Account_CurrentUser | WARNING | High',
   // SEC-MF-003 is quiet: SUB_Feedback_SendToServer only changes its non-persistable Feedback
   // parameter itself and writes none of its values into stored data.
 ];
 
 /** Rules the parser path skips (it does not read microflow bodies or the reference index). */
-const EXTENSION_ONLY = /^SEC-MF-/;
+// SEC-028 also reads where-used and microflow contents (to leave SEC-MF-001's microflows to it, and
+// to grade by data access), which the archive parser does not extract.
+const EXTENSION_ONLY = /^(SEC-MF-|SEC-028$)/;
 
 const line = (f) => `${f.id} | ${f.status} | ${f.severity}`;
 
@@ -63,13 +64,13 @@ function run() {
   return cached;
 }
 
-async function parserPath() {
+async function parserPath(enabledRules) {
   const { parseExtractedProject } = await import('@mendix-analyzer/mendix-parser');
   const { RuleEngine, RuleRegistry } = await import('@mendix-analyzer/rule-engine');
   const { ScoringEngine } = await import('@mendix-analyzer/scoring');
   const ir = parseExtractedProject(FIXTURE_ROOT, FIXTURE_MPR);
   const registry = new RuleRegistry();
-  registry.registerMany(securityCatalogue());
+  registry.registerMany(securityCatalogue({ enabledRules }));
   const summary = new RuleEngine(registry).evaluate(ir);
   return { summary, score: new ScoringEngine().calculateScores(summary, ir.coverage) };
 }
@@ -82,7 +83,7 @@ describeFixture('Security Analyzer extension on the reference project', () => {
   test('agrees finding-for-finding with the parser path', async () => {
     const { summary } = await parserPath();
     const oracle = summary.findings
-      .filter((f) => f.status === 'FAIL' || f.status === 'WARNING')
+      .filter((f) => (f.status === 'FAIL' || f.status === 'WARNING') && !EXTENSION_ONLY.test(f.ruleId))
       .map((f) => `${line(f)} | ${f.observation}`)
       .sort();
     // Compared on the rules both paths can run; the SEC-MF rules are locked above instead.
@@ -94,8 +95,8 @@ describeFixture('Security Analyzer extension on the reference project', () => {
   });
 
   test('produces the same Security score as the parser path, on the rules both can run', async () => {
-    const { score } = await parserPath();
     const disabled = Object.fromEntries(securityCatalogue().filter((r) => EXTENSION_ONLY.test(r.id)).map((r) => [r.id, false]));
+    const { score } = await parserPath(disabled);
     const result = analyzeSnapshot(snapshotFromMprContents(FIXTURE_ROOT, FIXTURE_MPR), { enabledRules: disabled });
     assert.equal(typeof result.securityScore, 'number');
     assert.equal(result.securityScore, score.categoryScores['Security']);
@@ -129,10 +130,10 @@ describeFixture('Security Analyzer extension on the reference project', () => {
     assert.deepEqual(disabled, ['SEC-008', 'SEC-009']);
   });
 
-  test('reports all 34 rules with a status, without SEC-007', () => {
+  test('reports all 33 rules with a status; SEC-007 and SEC-021 no longer exist', () => {
     const { rules } = run();
-    assert.equal(rules.length, 34);
-    assert.ok(!rules.some((r) => r.id === 'SEC-007'), 'SEC-007 is not run by the extension');
+    assert.equal(rules.length, 33);
+    assert.ok(!rules.some((r) => r.id === 'SEC-007' || r.id === 'SEC-021'), 'a removed rule is still in the catalogue');
     for (const r of rules) assert.ok(r.status, `${r.id} has no status`);
   });
 

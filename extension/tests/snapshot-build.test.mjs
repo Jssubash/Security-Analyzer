@@ -370,3 +370,191 @@ describe('microflows named by a constant', () => {
     assert.equal(run(true).findings.filter((f) => f.ruleId === 'SEC-MF-005').length, 0);
   });
 });
+
+describe('error handling on integration calls (SEC-MF-006)', () => {
+  const action = (id, $Type, extra = {}) => ({ $Type: 'Microflows$ActionActivity', $ID: id, disabled: false, action: { $Type, $ID: `${id}-a`, ...extra } });
+  const flow = (origin, destination, isErrorHandler = false) => ({ $Type: 'Microflows$SequenceFlow', $ID: `${origin}-${destination}`, origin, destination, isErrorHandler });
+  const run = (handling, withLog) =>
+    analyzeSnapshot({
+      ...snapshot({
+        projectUnits: [lockedDownSecurity],
+        units: [
+          moduleSecurity,
+          {
+            $Type: 'Microflows$Microflow',
+            name: 'ACT_Send',
+            allowedModuleRoles: [],
+            applyEntityAccess: true,
+            objectCollection: {
+              $Type: 'Microflows$MicroflowObjectCollection',
+              objects: [
+                { $Type: 'Microflows$StartEvent', $ID: 'start' },
+                action('rest', 'Microflows$RestCallAction', { errorHandlingType: handling }),
+                { $Type: 'Microflows$EndEvent', $ID: 'end' },
+                ...(withLog ? [action('log', 'Microflows$LogMessageAction', { errorHandlingType: 'Rollback' })] : []),
+                { $Type: 'Microflows$EndEvent', $ID: 'error-end' },
+              ],
+            },
+            flows: [
+              flow('start', 'rest'),
+              flow('rest', 'end'),
+              ...(withLog ? [flow('rest', 'log', true), flow('log', 'error-end')] : [flow('rest', 'error-end', true)]),
+            ],
+            $References: [],
+          },
+        ],
+      }),
+      referenceIndex: [],
+    }).findings.filter((f) => f.ruleId === 'SEC-MF-006' && f.status !== 'PASSED');
+
+  test('reads the error handling type and follows the error flow to a Log message', () => {
+    assert.deepEqual(run('CustomWithoutRollBack', true), []);
+    assert.deepEqual(run('Custom', true), []);
+  });
+
+  test('reports the default Rollback as High and an error flow without a log as Medium', () => {
+    assert.deepEqual(run('Rollback', false).map((f) => f.severity), ['High']);
+    assert.deepEqual(run('CustomWithoutRollBack', false).map((f) => f.severity), ['Medium']);
+  });
+});
+
+describe('naming integration calls (SEC-MF-006)', () => {
+  const activity = (id, caption, action) => ({ $Type: 'Microflows$ActionActivity', $ID: id, disabled: false, caption, autoGenerateCaption: caption === 'Activity', action: { $ID: `${id}-a`, errorHandlingType: 'Rollback', ...action } });
+  const observation = () =>
+    analyzeSnapshot({
+      ...snapshot({
+        projectUnits: [lockedDownSecurity],
+        units: [
+          moduleSecurity,
+          {
+            $Type: 'Microflows$Microflow',
+            name: 'ACT_Calls',
+            allowedModuleRoles: [],
+            applyEntityAccess: true,
+            objectCollection: {
+              $Type: 'Microflows$MicroflowObjectCollection',
+              objects: [
+                activity('ml', 'Activity', { $Type: 'Microflows$MLModelCallAction', mlMappingDocument: 'Shop.ChurnModel' }),
+                activity('rest', 'Renamed call', {
+                  $Type: 'Microflows$RestCallAction',
+                  httpConfiguration: {
+                    $Type: 'Microflows$HttpConfiguration',
+                    newHttpMethod: 'Get',
+                    customLocationTemplate: { $Type: 'Microflows$StringTemplate', text: '{1}/orders', arguments: [{ $Type: 'Microflows$TemplateArgument', expression: '@Shop.BaseUrl' }] },
+                  },
+                }),
+              ],
+            },
+            flows: [],
+            $References: [],
+          },
+        ],
+      }),
+      referenceIndex: [],
+    }).findings.find((f) => f.ruleId === 'SEC-MF-006')?.observation ?? '';
+
+  test('checks a Call ML model activity, named by its mapping', () => {
+    assert.match(observation(), /Call ML model Shop\.ChurnModel/);
+  });
+
+  test('checks a renamed activity by its type and names it by caption, method and URL', () => {
+    assert.match(observation(), /Call REST service "Renamed call" \(GET @Shop\.BaseUrl\/orders\)/);
+  });
+});
+
+describe('conversions without an empty check (SEC-MF-007)', () => {
+  const domainModel = {
+    $Type: 'DomainModels$DomainModel',
+    entities: [
+      { $Type: 'DomainModels$Entity', name: 'Item', attributes: [{ $Type: 'DomainModels$Attribute', name: 'Count', type: { $Type: 'DomainModels$IntegerAttributeType' } }] },
+    ],
+  };
+  const run = (value, decision) =>
+    analyzeSnapshot({
+      ...snapshot({
+        projectUnits: [lockedDownSecurity],
+        units: [
+          moduleSecurity,
+          domainModel,
+          {
+            $Type: 'Microflows$Microflow',
+            name: 'ACT_Total',
+            allowedModuleRoles: [],
+            applyEntityAccess: true,
+            objectCollection: {
+              $Type: 'Microflows$MicroflowObjectCollection',
+              objects: [
+                { $Type: 'Microflows$StartEvent', $ID: 'start' },
+                {
+                  $Type: 'Microflows$ActionActivity',
+                  $ID: 'retrieve',
+                  action: { $Type: 'Microflows$RetrieveAction', outputVariableName: 'ItemList', retrieveSource: { $Type: 'Microflows$DatabaseRetrieveSource', entity: 'Shop.Item' } },
+                },
+                {
+                  $Type: 'Microflows$LoopedActivity',
+                  $ID: 'loop',
+                  loopSource: { $Type: 'Microflows$IterableList', listVariableName: 'ItemList', variableName: 'IteratorItem' },
+                  objectCollection: {
+                    $Type: 'Microflows$MicroflowObjectCollection',
+                    objects: [
+                      ...(decision ? [{ $Type: 'Microflows$ExclusiveSplit', $ID: 'check', splitCondition: { $Type: 'Microflows$ExpressionSplitCondition', expression: decision } }] : []),
+                      {
+                        $Type: 'Microflows$ActionActivity',
+                        $ID: 'change',
+                        action: {
+                          $Type: 'Microflows$ChangeObjectAction',
+                          changeVariableName: 'IteratorItem',
+                          items: [{ $Type: 'Microflows$MemberChange', attribute: 'Shop.Item.Count', type: 'Set', value }],
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            flows: [
+              { $Type: 'Microflows$SequenceFlow', origin: 'start', destination: 'retrieve' },
+              { $Type: 'Microflows$SequenceFlow', origin: 'retrieve', destination: 'loop' },
+              ...(decision ? [{ $Type: 'Microflows$SequenceFlow', origin: 'check', destination: 'change' }] : []),
+            ],
+            $References: [],
+          },
+        ],
+      }),
+      referenceIndex: [],
+    }).findings.filter((f) => f.ruleId === 'SEC-MF-007' && f.status !== 'PASSED');
+
+  test('reads member expressions and knows a loop iterator\'s entity, so + on a number is a calculation', () => {
+    const [finding] = run('$IteratorItem/Count + 1');
+    assert.deepEqual(finding?.evidence.details.conversions, [
+      { activity: 'Change object', member: 'Shop.Item.Count', expression: '$IteratorItem/Count + 1', problem: 'calculation with $IteratorItem/Count without an empty check', activityId: 'change' },
+    ]);
+  });
+
+  test('accepts an earlier Decision that checks the value for empty', () => {
+    assert.deepEqual(run('$IteratorItem/Count + 1', '$IteratorItem/Count != empty'), []);
+  });
+});
+
+describe('Java actions that encrypt (SEC-005)', () => {
+  const java = (fileName, content) => ({ moduleDirectory: 'shop', fileName, relativePath: `javasource/shop/actions/${fileName}`, content });
+  const ir = () => {
+    const built = buildIrFromSnapshot({
+      ...snapshot({ projectUnits: [lockedDownSecurity], units: [moduleSecurity] }),
+      javaSources: [
+        java('Seal.java', 'import javax.crypto.Cipher; class Seal { void run() { Cipher c = Cipher.getInstance("AES"); c.init(Cipher.ENCRYPT_MODE, key); } }'),
+        java('Unseal.java', 'import javax.crypto.Cipher; class Unseal { void run() { c.init(Cipher.DECRYPT_MODE, key); } }'),
+        java('SealVia.java', 'class SealVia { String run() { return CryptoHelper.protect(value); } }'),
+        java('CryptoHelper.java', 'import javax.crypto.Cipher; class CryptoHelper { static String protect(String v) { c.init(Cipher.ENCRYPT_MODE, k); return v; } }'),
+      ],
+    });
+    return built.ir ?? built;
+  };
+
+  test('reads from the code whether an action encrypts, also through a helper class of its module', () => {
+    const encrypts = Object.fromEntries(ir().customCode.javaActions.map((j) => [j.name, j.encrypts]));
+    assert.equal(encrypts.Seal, true);
+    assert.equal(encrypts.Unseal, false);
+    assert.equal(encrypts.SealVia, true);
+  });
+});
